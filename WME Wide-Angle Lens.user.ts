@@ -5,10 +5,9 @@
 /// <reference path="../typescript-typings/globals/geojson/index.d.ts" />
 /// <reference path="../typescript-typings/wazewrap.d.ts" />
 /// <reference path="../typescript-typings/greasyfork.d.ts" />
-/// <reference path="../node_modules/wme-sdk-typings/index.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens
-// @version             2026.04.22.001
+// @version             2026.08.26.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Scan a large area
 // @author              vtpearce and crazycaveman (progress bar from dummyd2 & seb-d59)
@@ -21,6 +20,7 @@
 // @copyright           2020 vtpearce
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
 // @updateURL           https://greasyfork.org/scripts/40641-wme-wide-angle-lens/code/WME%20Wide-Angle%20Lens.meta.js
 // @downloadURL         https://greasyfork.org/scripts/40641-wme-wide-angle-lens/code/WME%20Wide-Angle%20Lens.user.js
 // @connect             greasyfork.org
@@ -28,9 +28,12 @@
 // @updateURL           https://greasyfork.org/scripts/418291-wme-wide-angle-lens-beta/code/WME%20Wide-Angle%20Lens.meta.js
 // @downloadURL         https://greasyfork.org/scripts/418291-wme-wide-angle-lens-beta/code/WME%20Wide-Angle%20Lens.user.js
 
-/* global W, OL, $, WazeWrap, OpenLayers, I18n */
+/* global turf, W, OL, $, WazeWrap, OpenLayers, I18n */
 declare var unsafeWindow: Window & typeof globalThis;
-import type { WmeSDK } from "wme-sdk-typings";
+
+import type { WmeSDK, Segment, Venue, MapComment, LonLat, ZoomLevel } from "wme-sdk-typings";
+import type { GeoJsonProperties, Feature, Point, Polygon, Geometry, BBox } from 'geojson';
+import type { Units, polygon, booleanIntersects, centroid } from "@turf/turf";
 
 namespace WMEWAL {
     const SCRIPT_NAME = GM_info.script.name;
@@ -40,7 +43,7 @@ namespace WMEWAL {
     const DOWNLOAD_URL = GM_info.script.downloadURL;
 
     const updateText = '<ul>'
-        + '<li>Updates for WazeWrap changes.</li>'
+        + '<li>SDK migration.</li>'
         + '</ul>';
 
     const greasyForkPage = 'https://greasyfork.org/scripts/40641';
@@ -194,15 +197,15 @@ namespace WMEWAL {
 
     export interface IPlugIn {
         Title: string;
-        MinimumZoomLevel: number;
+        MinimumZoomLevel: ZoomLevel;
         SupportsSegments: boolean;
         SupportsSuggestedSegments?: boolean;
         SupportsVenues: boolean;
         SupportsClosures?: boolean;
         GetTab(): string;
         TabLoaded(): void;
-        ScanExtent(segments: Array<WazeNS.Model.Object.Segment>,
-            venues: Array<WazeNS.Model.Object.Venue>,
+        ScanExtent(segments: Array<Segment>,
+            venues: Array<Venue>,
             suggestedSegments?: Array<WazeNS.Model.Object.SegmentSuggestion>): Promise<IResult>;
         ScanStarted(): boolean;
         ScanComplete(): void;
@@ -233,6 +236,7 @@ namespace WMEWAL {
         name: string;
         geometry?: OpenLayers.Geometry;
         geometryText?: string;
+        polygon?: Feature<Geometry>;
     }
 
     export interface IErrLoc {
@@ -240,10 +244,13 @@ namespace WMEWAL {
         Location: string;
     }
 
-    let topLeft: OpenLayers.Geometry.Point = null;
-    let bottomRight: OpenLayers.Geometry.Point = null;
+    let topLeft: Feature<Point> = null;
+    let bottomRight: Feature<Point> = null;
+    let rightCheck: Feature<Point> = null;
+    let bottomCheck: Feature<Point> = null;
+    let scanBbox: BBox = null;
 
-    export let areaToScan: OpenLayers.Geometry.Collection = null;
+    export let areaToScan: Feature<Geometry> = null; //OpenLayers.Geometry.Collection = null;
 
     let height: number;
     let width: number;
@@ -252,17 +259,16 @@ namespace WMEWAL {
     // let venues: Array<string> = null;
 
     export let areaName: string = null;
-    export let zoomLevel: number;
+    export let zoomLevel: ZoomLevel;
     export let outputTo: OutputTo;
     export let addBOM: boolean;
     export let outputFields: Array<string>;
     export let alwaysLoadClosures: boolean = false;
     const defaultOutputFields = ['CreatedEditor','LastEditor','LockLevel','Lat','Lon'];
 
-    let currentLon: number;
-    let currentLat: number;
-    let currentCenter: OpenLayers.LonLat = null;
-    let currentZoom: number = null;
+    let currentPt: Feature<Point> = null;
+    let saveCenter: LonLat = null;
+    let currentZoom: ZoomLevel = null;
     let layerToggle: Array<string> = null;
     let needClosures = false;
     let needSegments = false;
@@ -271,18 +277,17 @@ namespace WMEWAL {
     let cancelled = false;
     let totalViewports: number;
     let countViewports: number;
-    //let mapReady = false;
-    //let modelReady = false;
     let settings: ISettings = null;
     let plugins: Array<IPrivatePlugin> = [];
     const settingsKey = "WMEWAL_Settings";
-    const layerName = "WMEWAL_Areas";
+    const savedAreasKey = "WMEWAL_Areas";
+    const layerName = "Wide-Angle Lens Areas";
     const layerCheckbox = "Wide-Angle Lens Areas";
     let pb: ProgressBar = null;
     //let initCount = 0;
-    let layerCheckboxAdded = false;
-    let WALMap: OpenLayers.Map;
     let errList: Array<IErrLoc> = [];
+    const units: Units = "meters"
+    const u_meters = { units };
 
     const sandboxed = typeof unsafeWindow !== 'undefined';
     const pageWindow = sandboxed ? unsafeWindow : window;
@@ -314,7 +319,7 @@ namespace WMEWAL {
 
         loadScriptUpdateMonitor();
 
-        if (typeof (Storage) !== "undefined") {
+        if (typeof (localStorage) !== "undefined") {
             if (localStorage[settingsKey]) {
                 let settingsString = localStorage[settingsKey];
                 if (settingsString.substring(0, 1) === "~") {
@@ -355,10 +360,6 @@ namespace WMEWAL {
                     }
                 }
 
-                settings.SavedAreas.sort(function (a, b) {
-                    return a.name.localeCompare(b.name);
-                });
-
                 delete this.settingsString;
                 if (!Object.prototype.hasOwnProperty.call(settings, 'AddBOM')) {
                     settings.AddBOM = false;
@@ -371,41 +372,6 @@ namespace WMEWAL {
                 }
                 if (!Object.prototype.hasOwnProperty.call(settings, 'OutputFields')) {
                     settings.OutputFields = defaultOutputFields;
-                }
-
-                for (let ix = 0; ix < settings.SavedAreas.length; ix++) {
-                    if (settings.SavedAreas[ix].geometryText) {
-                        settings.SavedAreas[ix].geometry = <OpenLayers.Geometry> OpenLayers.Geometry.fromWKT(settings.SavedAreas[ix].geometryText);
-                        while ((settings.SavedAreas[ix].geometry.CLASS_NAME === "OL.Geometry.Collection" ||
-                                settings.SavedAreas[ix].geometry.CLASS_NAME === "OpenLayers.Geometry.Collection") &&
-                                (<OpenLayers.Geometry.Collection> settings.SavedAreas[ix].geometry).components.length === 1) {
-                            settings.SavedAreas[ix].geometry = (<OpenLayers.Geometry.Collection> settings.SavedAreas[ix].geometry).components[0];
-                        }
-                        delete settings.SavedAreas[ix].geometryText;
-                    }
-                }
-            } else if (localStorage["WMEMSL_areaList"]) {
-                // Import settings from old MSL script
-                const savedAreas = JSON.parse(localStorage["WMEMSL_areaList"]);
-                savedAreas.sort(function (a, b) {
-                    return a.name.localeCompare(b.name);
-                });
-                outputTo = OutputTo.CSV;
-                addBOM = false;
-                settings = {
-                    SavedAreas: savedAreas,
-                    ActivePlugins: [],
-                    OutputTo: "csv",
-                    Version: SCRIPT_VERSION,
-                    showLayer: false,
-                    AddBOM: addBOM,
-                    OutputFields: defaultOutputFields
-                };
-                for (let ix = 0; ix < settings.SavedAreas.length; ix++) {
-                    if (settings.SavedAreas[ix].geometryText) {
-                        settings.SavedAreas[ix].geometry = <OpenLayers.Geometry> OpenLayers.Geometry.fromWKT(settings.SavedAreas[ix].geometryText);
-                        delete settings.SavedAreas[ix].geometryText;
-                    }
                 }
 
             } else {
@@ -421,9 +387,70 @@ namespace WMEWAL {
                     OutputFields: defaultOutputFields
                 };
             }
+
+            if (localStorage[savedAreasKey]) {
+                let areasString = localStorage[savedAreasKey];
+                let areas: IArea[] = JSON.parse(areasString);
+                for (let ix = 0; ix < areas.length; ix++) {
+                    // check if loaded from settings (old format) and remove
+                    for (let j=settings.SavedAreas.length-1; j>=0; j--) {
+                        if (settings.SavedAreas[j].name == areas[ix].name) {
+                            settings.SavedAreas.splice(j,1);
+                        }
+                    }
+                    settings.SavedAreas.push(areas[ix]);
+                }
+            } else {
+                // convert saved areas to sep array with polygon
+                let projI = new OpenLayers.Projection("EPSG:900913");
+                let projE = new OpenLayers.Projection("EPSG:4326");
+                let badAreas = [];
+                for (let ix = 0; ix < settings.SavedAreas.length; ix++) {
+                    if (settings.SavedAreas[ix].geometryText) {
+                        settings.SavedAreas[ix].geometry = <OpenLayers.Geometry> OpenLayers.Geometry.fromWKT(settings.SavedAreas[ix].geometryText);
+                        while ((settings.SavedAreas[ix].geometry.CLASS_NAME === "OL.Geometry.Collection" ||
+                                settings.SavedAreas[ix].geometry.CLASS_NAME === "OpenLayers.Geometry.Collection") &&
+                                (<OpenLayers.Geometry.Collection> settings.SavedAreas[ix].geometry).components.length === 1) {
+                            settings.SavedAreas[ix].geometry = (<OpenLayers.Geometry.Collection> settings.SavedAreas[ix].geometry).components[0];
+                        }
+                        if (!settings.SavedAreas[ix].polygon) {
+                            const ar = settings.SavedAreas[ix].geometry.components[0];
+                            let npoly = [];
+                            for (let p=0; p<ar.components.length; p++) {
+                                const pt = ar.components[p];
+                                const npt = (new OpenLayers.LonLat(pt.x, pt.y)).transform(projI,projE);
+                                npoly.push( [npt.lon, npt.lat]);
+                            }
+                            const properties = { name: settings.SavedAreas[ix].name };
+                            try {
+                                settings.SavedAreas[ix].polygon = turf.polygon( [ npoly ], properties);
+                            }
+                            catch (e) {
+                                log('error', 'cant convert ' + settings.SavedAreas[ix].name, settings.SavedAreas[ix].geometryText);
+                                log('error', '  npoly ', npoly);
+                                log('error', 'Exception', e);
+                                badAreas.push(settings.SavedAreas[ix].name);
+                            }
+                            if (settings.SavedAreas[ix].polygon) {
+                                delete settings.SavedAreas[ix].geometryText;
+                            }
+                        }
+                    }
+                }
+                if (badAreas.length) {
+                    WazeWrap.Alerts.warning(SCRIPT_NAME, "Could not convert these areas. Look in developer console for messages that might help debug this. " + badAreas.join(', '));
+                }
+                saveAreas();
+            }
+
+            settings.SavedAreas.sort(function (a, b) {
+                return a.name.localeCompare(b.name);
+            });
+
         }
 
         WazeWrap.Interface.ShowScriptUpdate(SCRIPT_NAME, SCRIPT_VERSION, updateText, greasyForkPage, wazeForumThread);
+        settings.Version = SCRIPT_VERSION;
 
         let style = document.createElement("style");
         //style.type = "text/css";
@@ -443,19 +470,45 @@ namespace WMEWAL {
         style.innerHTML = css;
         document.body.appendChild(style);
 
-        log('log', 'Initialized');
-
-        await makeTab();
 
         //recreate tab here
 
         // Unit switched (imperial/metric)
-        if (W.prefs) {
-            W.prefs.on("change:isImperial", recreateTab);
-        }
+        //if (W.prefs) {
+        //    W.prefs.on("change:isImperial", recreateTab);
+        //}
 
-        // Create map object
-        WALMap = W.map.getOLMap();
+        const styleRules = [{
+            style: {
+                strokeColor: "#FF6600",
+                strokeOpacity: 0.8,
+                strokeWidth: 3,
+                fillOpacity: 0.00,
+                //label: settings.SavedAreas[ixA].name,
+                labelOutlineColor: "Black",
+                labelOutlineWidth: 3,
+                //fontSize: 14,
+                fontColor: "#FF6600",
+                fontOpacity: 0.85,
+                fontWeight: "bold"
+            },
+        } ];
+        const styleContext = {
+            label: (context) => context?.feature?.properties?.name,
+        };
+
+        sdk.Map.addLayer({layerName:layerName, styleRules, styleContext});
+        sdk.LayerSwitcher.addLayerCheckbox({ name: layerCheckbox, isChecked: settings.showLayer });
+        sdk.Events.on({ eventName: 'wme-layer-checkbox-toggled', eventHandler: (evt) => {
+            if (evt.name === layerCheckbox) {
+                sdk.Map.setLayerVisibility( { layerName, visibility: evt.checked });
+                settings.showLayer = evt.checked;
+                updateSettings();
+            }
+        } });
+
+        await makeTab();
+        log('log', 'Initialized');
 
         if (!walAvailable) {
             pageWindow.WMEWAL = WMEWAL;
@@ -660,110 +713,52 @@ namespace WMEWAL {
         addPluginTab(p);
     }
 
-    export function IsSegmentInArea(segment: WazeNS.Model.Object.Segment | WazeNS.Model.Object.SegmentSuggestion): boolean {
-        return areaToScan.intersects(segment.getAttribute('geometry'));
+    export function IsSegmentInArea(segment: Segment | WazeNS.Model.Object.SegmentSuggestion): boolean {
+        const ins = turf.booleanIntersects( areaToScan, segment.geometry);
+        return ins;
     }
 
-    function getVenueGeometry(venue: WazeNS.Model.Object.Venue): OpenLayers.Geometry {
-        if (venue.isPoint()) {
-            return venue.getOLGeometry();
-        } else {
-            return venue.getOLGeometry();
-        }
+    function getVenueGeometry(venue: Venue): Point | Polygon {
+        return venue.geometry;
     }
 
-    export function IsVenueInArea(venue: WazeNS.Model.Object.Venue): boolean {
-            return areaToScan.intersects(getVenueGeometry(venue));
+    export function IsVenueInArea(venue: Venue): boolean {
+        return turf.booleanIntersects( areaToScan, venue.geometry ); //areaToScan.intersects(getVenueGeometry(venue));
     }
 
-    function getMapCommentGeometry(mapComment: WazeNS.Model.Object.MapComment): OpenLayers.Geometry {
-        if (mapComment.isPoint()) {
-            return mapComment.getOLGeometry();
-        } else {
-            return mapComment.getOLGeometry();
-        }
+    function getMapCommentGeometry(mapComment: MapComment): Point | Polygon {
+        return mapComment.geometry;
     }
 
-    export function IsMapCommentInArea(mapComment: WazeNS.Model.Object.MapComment): boolean {
-        return areaToScan.intersects(getMapCommentGeometry(mapComment));
+    export function IsMapCommentInArea(mapComment: MapComment): boolean {
+        return turf.booleanIntersects( areaToScan, getMapCommentGeometry(mapComment));
     }
 
     function updateLayer(): void {
-        const features: Array<OpenLayers.Feature.Vector> = [];
 
-        let maLayer = W.map.getLayerByName(layerName);
-        if (maLayer === null || typeof maLayer === "undefined") {
-            maLayer = new OpenLayers.Layer.Vector(layerName, {});
-            I18n.translations[I18n.currentLocale()].layers.name[layerName] = "Wide-Angle Lens Areas";
-            W.map.addLayer(maLayer);
-            maLayer.setVisibility(settings.showLayer);
-        }
-
-        maLayer.removeAllFeatures({
-            silent: true
-        });
+        sdk.Map.removeAllFeaturesFromLayer({ layerName });
 
         for (let ixA = 0; ixA < settings.SavedAreas.length; ixA++) {
-            const style = {
-                strokeColor: "#FF6600",
-                strokeOpacity: 0.8,
-                strokeWidth: 3,
-                fillOpacity: 0.00,
-                label: settings.SavedAreas[ixA].name,
-                labelOutlineColor: "Black",
-                labelOutlineWidth: 3,
-                fontSize: 14,
-                fontColor: "#FF6600",
-                fontOpacity: 0.85,
-                fontWeight: "bold"
-            };
-            features.push(new OpenLayers.Feature.Vector(settings.SavedAreas[ixA].geometry.clone(), {
-                areaName: settings.SavedAreas[ixA].name,
-            }, style));
+            if (settings.SavedAreas[ixA].polygon)
+             sdk.Map.addFeatureToLayer( { feature: { type: 'Feature', id: ixA, 
+                geometry: settings.SavedAreas[ixA].polygon.geometry, 
+                properties: { name: settings.SavedAreas[ixA].name }, },
+                layerName } );
+
         }
 
-        maLayer.addFeatures(features);
-
-        if (!layerCheckboxAdded) {
-            sdk.LayerSwitcher.addLayerCheckbox({ name: layerCheckbox, isChecked: settings.showLayer });
-            sdk.Events.on({ eventName: 'wme-layer-checkbox-toggled', eventHandler: (evt) => {
-                if (evt.name === layerCheckbox) {
-                    maLayer.setVisibility(evt.checked);
-                    settings.showLayer = evt.checked;
-                    updateSettings();
-                }
-            } });
-
-            layerCheckboxAdded = true;
-        }
     }
 
-    // function addLatLonArray(latLonArray, arrayName): void
-    // {
-    //     let points: Array<OpenLayers.Geometry> = [];
-    //     for (let i = 0; i < latLonArray.length; i++)
-    //     {
-    //         points.push(new OpenLayers.Geometry.Point(latLonArray[i].lon, latLonArray[i].lat).transform(new OpenLayers.Projection("EPSG:4326"), W.map.getProjectionObject()));
-    //     }
-
-    //     let ring = new OpenLayers.Geometry.LinearRing(points);
-    //     let polygon = new OpenLayers.Geometry.Polygon([ring]);
-
-    //     savedAreas.push({name: arrayName, geometry: polygon});
-    // }
-
     function addNewArea(): void {
-        let theVenue: WazeNS.Model.Object.Venue = null;
+        let theVenue: Venue = null;
         let count = 0;
-        for (let v in W.model.venues.objects) {
-            if (W.model.venues.objects.hasOwnProperty(v) === false) {
+        const vlist = sdk.DataModel.Venues.getAll();
+        for (let v in vlist) {
+            const venue = vlist[v];
+              if (venue.geometry.type == 'Point') {
                 continue;
             }
-            const venue = W.model.venues.objects[v];
-            if (venue.isPoint() === true) {
-                continue;
-            }
-            if ($.isNumeric(venue.attributes.id) && parseInt(venue.attributes.id) <= 0) {
+            if ($.isNumeric(venue.id) && parseInt(venue.id) <= 0) {
                 theVenue = venue;
                 count++;
             }
@@ -779,7 +774,7 @@ namespace WMEWAL {
             return;
         }
 
-        if (theVenue.getAttribute('geometry').components.length !== 1) {
+        if (theVenue.geometry.coordinates.length !== 1) {
             alert("Can't parse the geometry");
             return;
         }
@@ -793,10 +788,11 @@ namespace WMEWAL {
 
         const savedArea: IArea = {
             name: nameBox.value.trim(),
-            geometry: theVenue.getAttribute('geometry').clone()
+            polygon: turf.polygon( theVenue.geometry.coordinates )
         };
         settings.SavedAreas.push(savedArea);
         updateSavedAreasList();
+        saveAreas();
 
         if (W.model.actionManager.canUndo()) {
             if (confirm("Undo all edits (OK=Yes, Cancel=No)?")) {
@@ -818,16 +814,24 @@ namespace WMEWAL {
             settings.SavedAreas.splice(index, 1);
 
             updateSavedAreasList();
+            saveAreas();
         }
     }
 
     function updateSavedAreasList(): void {
         function getCenterFunc(index: number): any {
             return function () {
-                const center = settings.SavedAreas[index].geometry.getCentroid();
-                const lonlat = new OpenLayers.LonLat(center.x, center.y);
-                W.map.moveTo(lonlat);
-                // W.map.setCenter(lonlat);
+                if (settings.SavedAreas[index].polygon) {
+                    const center = turf.centroid(settings.SavedAreas[index].polygon);
+                    const lonLat = {lon:center.geometry.coordinates[0], lat:center.geometry.coordinates[1]};
+                    sdk.Map.setMapCenter({ lonLat } );
+                } else {
+                    const center = settings.SavedAreas[index].geometry?.getCentroid();
+                    if (center) {
+                        const lonlat = new OpenLayers.LonLat(center.x, center.y);
+                        W.map.moveTo(lonlat);
+                    }
+                }
             };
         }
 
@@ -882,7 +886,7 @@ namespace WMEWAL {
     }
 
     function updateSettings(): void {
-        if (typeof Storage !== "undefined") {
+        if (typeof localStorage !== "undefined") {
             outputTo = parseOutputTo($("#_wmewalScanOutputTo").val());
             addBOM = $('#_wmewalAddBOM').prop('checked');
 
@@ -898,13 +902,30 @@ namespace WMEWAL {
                 AddBOM: addBOM,
                 OutputFields: outputFields
             };
+
+            localStorage[settingsKey] = JSON.stringify(newSettings);
+        }
+    }
+
+    function saveAreas(): void {
+        if (typeof localStorage !== "undefined") {
+            let newSavedAreas = [];
             for (let ix = 0; ix < settings.SavedAreas.length; ix++) {
-                newSettings.SavedAreas.push({
-                    name: settings.SavedAreas[ix].name,
-                    geometryText: settings.SavedAreas[ix].geometry.toString()
-                });
+                if (settings.SavedAreas[ix].polygon) {
+                    newSavedAreas.push({
+                        name: settings.SavedAreas[ix].name,
+                        polygon: settings.SavedAreas[ix].polygon
+                    });
+                }
+                else if (settings.SavedAreas[ix].geometryText) {
+                    newSavedAreas.push({
+                        name: settings.SavedAreas[ix].name,
+                        geometryText: settings.SavedAreas[ix].geometryText
+                    });
+                }
             }
-            localStorage[settingsKey] = "~" + LZString.compressToUTF16(JSON.stringify(newSettings));
+
+            localStorage[savedAreasKey] = JSON.stringify(newSavedAreas, function(key, val) { return val.toFixed ? Number(val.toFixed(5)) : val; });
         }
     }
 
@@ -934,17 +955,23 @@ namespace WMEWAL {
                 alert("Could not parse geometry.");
                 return;
             }
-            // Assume geometry is in EPSG:4326 and reproject to Spherical Mercator
-            const fromProj = new OpenLayers.Projection("EPSG:4326");
-            const c = <OpenLayers.Geometry.Collection> feature.geometry.clone();
-            c.transform(fromProj, W.map.getProjectionObject());
+
+            const ar = feature.geometry.components[0];
+            let npoly = [];
+            for (let p=0; p<ar.components.length; p++) {
+                const pt = ar.components[p];
+                npoly.push( [pt.x, pt.y]);
+            }
+            //console.log('WAL new area  ' + name, npoly);
+            const properties = { name };
 
             const savedArea: IArea = {
                 name: name,
-                geometry: c
+                polygon: turf.polygon( [ npoly ], properties)
             };
             settings.SavedAreas.push(savedArea);
             updateSavedAreasList();
+            saveAreas();
         };
 
         reader.readAsText(input.files[0]);
@@ -955,10 +982,10 @@ namespace WMEWAL {
             return;
         }
 
-        areaToScan.calculateBounds();
-        const bounds = areaToScan.getBounds();
-        topLeft = new OpenLayers.Geometry.Point(bounds.left, bounds.top);
-        bottomRight = new OpenLayers.Geometry.Point(bounds.right, bounds.bottom);
+        //areaToScan.calculateBounds();
+        scanBbox = turf.bbox(areaToScan); //bbox extent in [minX, minY, maxX, maxY] order
+        topLeft = turf.point( [scanBbox[0], scanBbox[3]] ); //new OpenLayers.Geometry.Point(bounds.left, bounds.top);
+        bottomRight = turf.point( [scanBbox[2], scanBbox[1]] );
     }
 
     async function waitFeaturesLoaded() {
@@ -1043,14 +1070,9 @@ namespace WMEWAL {
 
             layerToggle = null;
         }
-        if (currentCenter != null) {
+        if (saveCenter != null) {
             log("Debug","Moving back to original location");
-            W.map.moveTo(currentCenter);
-            // W.map.setCenter(currentCenter);
-        }
-        if (currentZoom != null) {
-            log("Debug","Resetting zoom");
-            WALMap.zoomTo(currentZoom);
+            sdk.Map.setMapCenter({ lonLat: saveCenter, zoomLevel: currentZoom} );
         }
 
         // segments = null;
@@ -1080,12 +1102,14 @@ namespace WMEWAL {
             return;
         }
 
-        const c = new OpenLayers.Geometry.Collection([settings.SavedAreas[index].geometry.clone()]);
-        // Transform the collection to EPSG:4326
-        const toProj = new OpenLayers.Projection("EPSG:4326");
-        c.transform(W.map.getProjectionObject(), toProj);
+        let geoText = 'POLYGON((';
+        let pts = settings.SavedAreas[index].polygon.geometry.coordinates[0];
+        for (let i=0; i<pts.length; i++) {
+            const c = pts[i];
+            geoText += c[0].toFixed(5) + ' ' + c[1].toFixed(5) + ',';
+        }
+        geoText = geoText.slice(0,-1) + '))'
 
-        const geoText = c.toString();
         const encodedUri = "data:text/plain;charset=utf-8," + encodeURIComponent(geoText);
         const link = <HTMLAnchorElement> document.createElement("a");
         link.setAttribute("href", encodedUri);
@@ -1138,7 +1162,11 @@ namespace WMEWAL {
         }
 
         settings.SavedAreas[index].name = newName;
+        if (settings.SavedAreas[index].polygon?.properties) {
+            settings.SavedAreas[index].polygon.properties.name = newName;
+        }
         updateSavedAreasList();
+        saveAreas();
     }
 
     async function scanArea(): Promise<void> {
@@ -1161,10 +1189,10 @@ namespace WMEWAL {
         let name: string;
         if (index == settings.SavedAreas.length) {
             // Scanning current window
-            areaToScan = <OpenLayers.Geometry.Collection> W.map.getOLExtent().toGeometry();
+            areaToScan = turf.bboxPolygon(sdk.Map.getMapExtent());
             name = 'Current window';
         } else {
-            areaToScan = <OpenLayers.Geometry.Collection> settings.SavedAreas[index].geometry;
+            areaToScan = settings.SavedAreas[index].polygon;
             name = settings.SavedAreas[index].name;
         }
 
@@ -1248,11 +1276,11 @@ namespace WMEWAL {
         window.addEventListener('unload', cancel);
 
         // Save current state
-        currentCenter = W.map.getCenter();
-        currentZoom = W.map.zoom;
+        saveCenter = sdk.Map.getMapCenter();
+        currentZoom = sdk.Map.getZoomLevel();
         layerToggle = [];
 
-        const groups = $("div.layer-switcher li.group");
+        const groups = $("div.layer-switcher li[class^='group']");
         groups.each(function (ix, g) {
             const groupToggle = $(g).find("wz-toggle-switch");
             if (groupToggle.length > 0) {
@@ -1290,7 +1318,7 @@ namespace WMEWAL {
                         }
                         break;
                     case "layer-switcher-group_road":
-                        if (needClosures) {
+                        if (needClosures || needSegments) {
                             if (!$(groupToggle).prop("checked")) {
                                 $(groupToggle).trigger("click");
                                 layerToggle.push($(groupToggle).attr("id"));
@@ -1298,8 +1326,14 @@ namespace WMEWAL {
                             // Loop through each child in the group
                             $(g).find("ul > li > div > wz-checkbox").each(function (ixChild, c) {
                                 switch ($(c).attr("id")) {
+                                    case "layer-switcher-item_road":
+                                        if ($(c).prop("checked") != needSegments) {
+                                            $(c).trigger("click");
+                                            layerToggle.push($(c).attr("id"));
+                                        }
+                                        break;
                                     case "layer-switcher-item_closures":
-                                        if (!$(c).prop("checked")) {
+                                        if ($(c).prop("checked") != needClosures) {
                                             $(c).trigger("click");
                                             layerToggle.push($(c).attr("id"));
                                         }
@@ -1428,7 +1462,7 @@ namespace WMEWAL {
         }
 
         // Reload road layers
-        if (!W.model.actionManager.canUndo()) {
+/*        if (!W.model.actionManager.canUndo()) {
             for (let ix = 0; ix < W.map.roadLayers.length; ix++) {
                 W.map.roadLayers[ix].redraw(true);
             }
@@ -1437,9 +1471,9 @@ namespace WMEWAL {
             } else {
                 W.controller.reload();
             }
-        }
+        } */
 
-        let minZoomLevel = 0;
+        let minZoomLevel: ZoomLevel = 10;
         for (let ix = 0; ix < plugins.length; ix++) {
             if (plugins[ix].Active) {
                 if (plugins[ix].MinimumZoomLevel > minZoomLevel) {
@@ -1450,15 +1484,29 @@ namespace WMEWAL {
 
         zoomLevel = minZoomLevel;
         log('info', `Zooming to ${zoomLevel}`);
-        WALMap.zoomTo(zoomLevel);
+        sdk.Map.setZoomLevel({zoomLevel});  //WALMap.zoomTo(zoomLevel);
 
-        const extent = W.map.getOLExtent();
-        height = extent.getHeight();
-        width = extent.getWidth();
+        //const extent = W.map.getOLExtent();
+        //height = extent.getHeight();
+        //width = extent.getWidth();
+        const [minX, minY, maxX, maxY] = scanBbox;
+        const s1 = turf.point( [minX,minY]);
+        const s2 = turf.point( [maxX,minY]);
+        const s3 = turf.point( [minX,maxY]);
+        const scanwid = turf.distance(s1,s2,u_meters);
+        const scanht = turf.distance(s1,s3,u_meters);
 
         // Figure out how many horizontal and vertical viewports there are
-        const horizontalSpan = Math.floor((bottomRight.x - topLeft.x) / width) + 2;
-        const verticalSpan = Math.floor((topLeft.y - bottomRight.y) / height) + 2;
+        const [left, bottom, right, top] = sdk.Map.getMapExtent();
+        const p1 = turf.point( [left,top]);
+        const p2 = turf.point( [right,top]);
+        const p3 = turf.point( [left,bottom]);
+        width = turf.distance(p1,p2,u_meters);
+        height = turf.distance(p1,p3,u_meters);
+        rightCheck = turf.destination(bottomRight, width, 90, u_meters);
+        bottomCheck = turf.destination(bottomRight, height + 50, 180, u_meters);
+        const horizontalSpan = Math.floor(scanwid / width) + 2;
+        const verticalSpan = Math.floor(scanht / height) + 2;
         totalViewports = horizontalSpan * verticalSpan + 1;
         countViewports = 0;
 
@@ -1466,8 +1514,8 @@ namespace WMEWAL {
         log("Debug","Vertical span = " + verticalSpan.toString());
         log("Debug","Total viewports = " + totalViewports.toString());
 
-        currentLon = topLeft.x - width;
-        currentLat = topLeft.y;
+    //    currentLon = topLeft.coordinates[0] - width;
+        currentPt = turf.destination(topLeft, width, -90, u_meters);
 
         pb.show();
 
@@ -1504,13 +1552,16 @@ namespace WMEWAL {
                 countViewports += 1;
                 log("Debug","Count viewports = " + countViewports.toString());
 
-                currentLon += width;
-                if (currentLon > bottomRight.x + width) {
-                    log("Debug","New row");
+                currentPt = turf.destination(currentPt, width, 90, u_meters);
+                //currentLon += width;
+                if (currentPt.geometry.coordinates[0] > rightCheck.geometry.coordinates[0]) {
                     // Start at next row
-                    currentLon = topLeft.x;
-                    currentLat -= height;
-                    if (currentLat < bottomRight.y - height) {
+                    //currentLon = topLeft.x;
+                    //currentLat -= height;
+                    currentPt = turf.destination(currentPt, height, 180, u_meters);
+                    currentPt.geometry.coordinates[0] = topLeft.geometry.coordinates[0];
+                //log("Debug", "New row  new Y " + currentPt.geometry.coordinates[1] + " chk Y " + bottomCheck.geometry.coordinates[1] );
+                    if (currentPt.geometry.coordinates[1] < bottomCheck.geometry.coordinates[1]) { //if (currentLat < bottomRight.y - height) {
                         done = true;
                     }
                 }
@@ -1518,14 +1569,23 @@ namespace WMEWAL {
                 if (!done) {
                     // Check to see if the new window would be within the boundaries of the original area
                     // Create a geometry object for the window boundaries
-                    const points: Array<OpenLayers.Geometry.Point> = [];
-                    points.push(new OpenLayers.Geometry.Point(currentLon - (width / 2), currentLat + (height / 2)));
-                    points.push(new OpenLayers.Geometry.Point(currentLon + (width / 2), currentLat + (height / 2)));
-                    points.push(new OpenLayers.Geometry.Point(currentLon - (width / 2), currentLat - (height / 2)));
-                    points.push(new OpenLayers.Geometry.Point(currentLon + (width / 2), currentLat - (height / 2)));
-                    const lr = new OpenLayers.Geometry.LinearRing(points);
-                    const poly = new OpenLayers.Geometry.Polygon([lr]);
-                    inGeometry = areaToScan && areaToScan.intersects(poly);
+                    let tlPt = turf.destination(currentPt, height/2, 0, u_meters);
+                    tlPt = turf.destination(tlPt, width/2, 270, u_meters);
+                    let brPt = turf.destination(currentPt, height/2, 180, u_meters);
+                    brPt = turf.destination(brPt, width/2, 90, u_meters);
+                    const top = tlPt.geometry.coordinates[1];
+                    const bot = brPt.geometry.coordinates[1];
+                    const left = tlPt.geometry.coordinates[0];
+                    const right = brPt.geometry.coordinates[0];
+                    let npoly = [];
+                    npoly.push( [left, top]);
+                    npoly.push( [left, bot]);
+                    npoly.push( [right, bot]);
+                    npoly.push( [right, top]);
+                    npoly.push( [left, top]);
+
+                    const calcEx = turf.polygon( [ npoly ] );
+                    inGeometry = turf.booleanIntersects(areaToScan, calcEx)
                 }
             }
 
@@ -1562,24 +1622,19 @@ namespace WMEWAL {
             abort = false;
             abortOnFailure = true;
             let retryCount = 0;
-            const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(currentLon, currentLat);
-            const url = WMEWAL.GenerateBasePL(latlon.lat, latlon.lon, WMEWAL.zoomLevel);
+            const lonLat = {lon:currentPt.geometry.coordinates[0], lat:currentPt.geometry.coordinates[1]};
+            const url = WMEWAL.GenerateBasePL(lonLat.lat, lonLat.lon, WMEWAL.zoomLevel);
             do {
                 retry = false;
                 if (!cancelled) {
                     try {
-                        //var p = onModelReady(false);
-                        //const lonLat = { lat: +lat, lon: +lon };
-                        sdk.Map.setMapCenter({ lonLat: latlon} );
+                        log("debug", "Lon " + lonLat.lon + "  lat " + lonLat.lat );
+                        sdk.Map.setMapCenter({ lonLat } );
                         let p = waitFeaturesLoaded();
                         try {
                             await promiseTimeout(10000, p);
-                            const ven = W.model.venues.getObjectArray();
-                            const cityc = W.model.cities.getObjectArray().length;
-                            const cntryc = W.model.countries.getObjectArray().length;
-                            const segc = W.model.segments.getObjectArray().length;
                             const usrc = W.model.users.getObjectArray().length;
-                            log("debug", "venues " + ven.length + " segs " + segc + " cntry " + cntryc + " users " + usrc);
+                            log("debug", " users " + usrc);
                             if (usrc < 2) {
                                 log("warn", "SKIP - no data at location " + url);
                                 retryCount++;
@@ -1647,8 +1702,8 @@ namespace WMEWAL {
     async function scanExtent(): Promise<ScanStatus> {
         let keepScanning = true;
         if (!cancelled) {
-            let extentSegments: Array<WazeNS.Model.Object.Segment> = [];
-            let extentVenues: Array<WazeNS.Model.Object.Venue> = [];
+            let extentSegments: Array<Segment> = [];
+            let extentVenues: Array<Venue> = [];
             let extentSuggestedSegments: Array<WazeNS.Model.Object.SegmentSuggestion> = [];
 
             // Check to see if the current extent is completely within the area being searched
@@ -1660,47 +1715,20 @@ namespace WMEWAL {
             // log("Debug","Extent is " + (!allIn ? "NOT " : "") + "entirely within area");
 
             if (needSegments) { // && segments != null) {
-                log("Debug","scanExtent: Collecting segments");
-                extentSegments = W.model.segments.getObjectArray();
-                // for (let seg in W.model.segments.objects) {
-                //     // if (segments.indexOf(seg) === -1) {
-                //         const segment = W.model.segments.getObjectById(parseInt(seg));
-                //         if (segment != null) {
-                //             // segments.push(seg);
-                //             extentSegments.push(segment);
-                //         }
-                //     // }
-                // }
+                //log("Debug","scanExtent: Collecting segments");
+                extentSegments = sdk.DataModel.Segments.getAll();
                 log("Debug",`scanExtent: Done collecting segments (${extentSegments.length})`);
             }
 
             if (needVenues) { //} && venues != null) {
-                log("Debug","scanExtent: Collecting venues");
-                extentVenues = W.model.venues.getObjectArray();
-                // for (let ven in W.model.venues.objects) {
-                //     // if (venues.indexOf(ven) === -1) {
-                //         const venue = W.model.venues.getObjectById(ven);
-                //         if (venue != null) {
-                //             // venues.push(ven);
-                //             extentVenues.push(venue);
-                //         }
-                //     // }
-                // }
+                //log("Debug","scanExtent: Collecting venues");
+                extentVenues = sdk.DataModel.Venues.getAll();
                 log("Debug",`scanExtent: Done collecting venues (${extentVenues.length})`);
             }
 
             if (needSuggestedSegments) { // && segments != null) {
-                log("Debug","scanExtent: Collecting suggested segments");
+                //log("Debug","scanExtent: Collecting suggested segments");
                 extentSuggestedSegments = W.model.segmentSuggestions.getObjectArray();
-                // for (let seg in W.model.segmentSuggestions.objects) {
-                //     // if (segments.indexOf(seg) === -1) {
-                //         const segment = W.model.segmentSuggestions.getObjectById(parseInt(seg));
-                //         if (segment != null) {
-                //             // segments.push(seg);
-                //             extentSuggestedSegments.push(segment);
-                //         }
-                //     // }
-                // }
                 log("Debug",`scanExtent: Done collecting suggested segments (${extentSuggestedSegments.length})`);
             }
 
@@ -1886,7 +1914,7 @@ namespace WMEWAL {
         if (zoom < 12) {
             zoom += 12;
         }
-        return "https://www.waze.com/editor/?env=" + W.app.getAppRegionCode() + "&lon=" + lon + "&lat=" + lat + "&zoomLevel=" + zoom;
+        return "https://www.waze.com/editor/?env=" + sdk.Settings.getRegionCode() + "&lon=" + lon + "&lat=" + lat + "&zoomLevel=" + zoom;
     }
 
     export function CompareVersions(v1: string, v2: string) : number {

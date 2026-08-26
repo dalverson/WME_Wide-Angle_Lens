@@ -1,12 +1,7 @@
-/// <reference path="../typescript-typings/globals/openlayers/index.d.ts" />
-/// <reference path="../typescript-typings/I18n.d.ts" />
-/// <reference path="../typescript-typings/waze.d.ts" />
-/// <reference path="../typescript-typings/globals/jquery/index.d.ts" />
 /// <reference path="WME Wide-Angle Lens.user.ts" />
-/// <reference path="../typescript-typings/greasyfork.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens Map Comments
-// @version             2026.04.22.001
+// @version             2026.08.26.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Find map comments that match filter criteria
 // @author              vtpearce and crazycaveman
@@ -19,6 +14,7 @@
 // @copyright           2020 vtpearce
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
 // @updateURL           https://greasyfork.org/scripts/40644-wme-wide-angle-lens-map-comments/code/WME%20Wide-Angle%20Lens%20Map%20Comments.meta.js
 // @downloadURL         https://greasyfork.org/scripts/40644-wme-wide-angle-lens-map-comments/code/WME%20Wide-Angle%20Lens%20Map%20Comments.user.js
 // @connect             greasyfork.org
@@ -26,7 +22,10 @@
 // @updateURL           https://greasyfork.org/scripts/418294-wme-wide-angle-lens-map-comments-beta/code/WME%20Wide-Angle%20Lens%20Map%20Comments.meta.js
 // @downloadURL         https://greasyfork.org/scripts/418294-wme-wide-angle-lens-map-comments-beta/code/WME%20Wide-Angle%20Lens%20Map%20Comments.user.js
 
-/*global W, OL, $, WazeWrap, WMEWAL, OpenLayers, I18n */
+/*global turf, W, $, WazeWrap, WMEWAL, I18n */
+import type { WmeSDK, MapComment, Segment, Venue, LonLat } from "wme-sdk-typings";
+import { Feature, Point } from 'geojson';
+declare var unsafeWindow: Window;
 
 namespace WMEWAL_MapComments {
 
@@ -35,14 +34,14 @@ namespace WMEWAL_MapComments {
     const DOWNLOAD_URL = GM_info.script.downloadURL;
 
     const updateText = '<ul>'
-        + '<li>Compatibility release.</li>'
+        + '<li>SDK migration.</li>'
         + '</ul>';
     const greasyForkPage = 'https://greasyfork.org/scripts/40644';
     const wazeForumThread = 'https://www.waze.com/discuss/t/script-wme-wide-angle-lens/77807';
 
     const ctlPrefix = "_wmewalMapComments";
 
-    const minimumWALVersionRequired = "2025.04.10.001";
+    const minimumWALVersionRequired = "2026.06.06.001";
 
     enum Operation {
         Equal = 1,
@@ -60,7 +59,7 @@ namespace WMEWAL_MapComments {
         title: string;
         lockLevel: number;
         expirationDate: number;
-        center: OpenLayers.Geometry.Point;
+        center: Feature<Point>;
         createdOn: number;
         updatedOn: number;
     }
@@ -76,9 +75,9 @@ namespace WMEWAL_MapComments {
         ExpirationOperation: Operation;
         LockLevel: number;
         LockLevelOperation: Operation;
-        LastModifiedBy: number;
+        LastModifiedByName: string;
         EditableByMe: boolean;
-        CreatedBy: number;
+        CreatedByName: string;
     }
 
     interface ISettings extends ISaveableSettings {
@@ -103,22 +102,28 @@ namespace WMEWAL_MapComments {
 
     const settingsKey = "WMEWALMapCommentsSettings";
     const savedSettingsKey = "WMEWALMapCommentsSavedSettings";
+    let sdk: WmeSDK;
     let settings: ISettings = null;
     let savedSettings: Array<ISavedSetting> = [];
     let mapComments: Array<IMapComment>;
     let titleRegex: RegExp = null;
     let commentRegex: RegExp = null;
-    let lastModifiedBy: WazeNS.Model.Object.User;
     let lastModifiedByName: string;
-    let createdBy: WazeNS.Model.Object.User;
     let createdByName: string;
     let mc: Array<string> = null;
     let initCount = 0;
+
+    const sandboxed = typeof unsafeWindow !== 'undefined';
+    const pageWindow = sandboxed ? unsafeWindow : window;
+    pageWindow.SDK_INITIALIZED.then(() => {
+        onWmeReady();
+    });
 
     function onWmeReady() {
         initCount++;
         if (WazeWrap && WazeWrap.Ready && typeof(WMEWAL) !== 'undefined' && WMEWAL && WMEWAL.RegisterPlugIn) {
             log('debug','WazeWrap and WMEWAL ready.');
+            sdk = WMEWAL.sdk;
             init();
         } else {
             if (initCount < 60) {
@@ -127,14 +132,6 @@ namespace WMEWAL_MapComments {
             } else {
                 log('error','WazeWrap or WMEWAL not ready. Giving up.');
             }
-        }
-    }
-
-    function bootstrap() {
-        if (W?.userscripts?.state.isReady) {
-            onWmeReady();
-        } else {
-            document.addEventListener('wme-ready', onWmeReady, { once: true });
         }
     }
 
@@ -182,11 +179,11 @@ namespace WMEWAL_MapComments {
                 ExpirationDate: null,
                 LockLevel: null,
                 LockLevelOperation: Operation.Equal,
-                LastModifiedBy: null,
+                LastModifiedByName: "",
                 EditableByMe: true,
                 Expiration: false,
                 ExpirationOperation: Operation.GreaterThanOrEqual,
-                CreatedBy: null
+                CreatedByName: ""
             };
         } else {
             if (updateProperties()) {
@@ -240,10 +237,10 @@ namespace WMEWAL_MapComments {
             `<label for='${ctlPrefix}CommentsIgnoreCase' class='wal-label'>Ignore case</label></td></tr>`;
         html += "<tr><td><b>Created By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}CreatedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}CreatedByName'></select></td></tr>`;
         html += "<tr><td><b>Last Updated By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}LastModifiedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}LastModifiedByName'></select></td></tr>`;
         html += "<tr><td><b>Geometry Type:</b></td></tr>" +
             `<tr><td class='wal-indent'><select id='${ctlPrefix}GeometryType'>` +
             "<option value=''></option>" +
@@ -267,16 +264,16 @@ namespace WMEWAL_MapComments {
     }
 
     export function TabLoaded(): void {
-        updateUsers($(`#${ctlPrefix}LastModifiedBy`));
-        updateUsers($(`#${ctlPrefix}CreatedBy`));
+        updateUsers($(`#${ctlPrefix}LastModifiedByName`));
+        updateUsers($(`#${ctlPrefix}CreatedByName`));
         updateUI();
         updateSavedSettingsList();
 
-        $(`#${ctlPrefix}LastModifiedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}LastModifiedBy`));
+        $(`#${ctlPrefix}LastModifiedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}LastModifiedByName`));
         });
-        $(`#${ctlPrefix}CreatedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}CreatedBy`));
+        $(`#${ctlPrefix}CreatedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}CreatedByName`));
         });
 
         $(`#${ctlPrefix}LoadSetting`).on("click", loadSetting);
@@ -286,7 +283,7 @@ namespace WMEWAL_MapComments {
 
     function updateUsers(selectUsernameList: JQuery): void {
         // Preserve current selection
-        const currentId: number = parseInt(selectUsernameList.val());
+        const currentUser: string = selectUsernameList.val();
 
         selectUsernameList.empty();
 
@@ -312,9 +309,9 @@ namespace WMEWAL_MapComments {
 
         for (let ix = 0; ix < userObjs.length; ix++) {
             const o = userObjs[ix];
-            const userOption = $("<option/>").text(o.name).attr("value", o.id);
+            const userOption = $("<option/>").text(o.name).attr("value", o.name);
 
-            if (currentId != null && o.id == null) {
+            if (currentUser != null && o.id == null) {
                 userOption.attr("selected", "selected");
             }
             selectUsernameList.append(userOption);
@@ -341,8 +338,8 @@ namespace WMEWAL_MapComments {
         $(`#${ctlPrefix}Comments`).val(settings.CommentRegex || "");
         $(`#${ctlPrefix}CommentsIgnoreCase`).prop("checked", settings.CommentRegexIgnoreCase);
         $(`#${ctlPrefix}Editable`).prop("checked", settings.EditableByMe);
-        $(`#${ctlPrefix}LastModifiedBy`).val(settings.LastModifiedBy);
-        $(`#${ctlPrefix}CreatedBy`).val(settings.CreatedBy);
+        $(`#${ctlPrefix}LastModifiedByName`).val(settings.LastModifiedByName);
+        $(`#${ctlPrefix}CreatedByName`).val(settings.CreatedByName);
         $(`#${ctlPrefix}Expiration`).prop("checked", settings.Expiration);
         $(`#${ctlPrefix}ExpirationOp`).val(settings.ExpirationOperation);
 
@@ -381,13 +378,13 @@ namespace WMEWAL_MapComments {
 
         const s = getSettings();
 
-        const selectedUpdateUser = $(`#${ctlPrefix}LastModifiedBy`).val();
-        if (nullif(selectedUpdateUser, "") !== null && s.LastModifiedBy === null) {
+        const selectedUpdateUser = $(`#${ctlPrefix}LastModifiedByName`).val();
+        if (nullif(selectedUpdateUser, "") !== null && s.LastModifiedByName == "") {
             addMessage("Invalid last updated user");
         }
 
-        const selectedCreateUser = $(`#${ctlPrefix}CreatedBy`).val();
-        if (nullif(selectedCreateUser, "") !== null && s.CreatedBy === null) {
+        const selectedCreateUser = $(`#${ctlPrefix}CreatedByName`).val();
+        if (nullif(selectedCreateUser, "") !== null && s.CreatedByName == "") {
             addMessage("Invalid created by user");
         }
 
@@ -460,22 +457,22 @@ namespace WMEWAL_MapComments {
             CommentRegex: null,
             CommentRegexIgnoreCase: $(`#${ctlPrefix}CommentsIgnoreCase`).prop("checked"),
             EditableByMe: $(`#${ctlPrefix}Editable`).prop("checked"),
-            LastModifiedBy: null,
+            LastModifiedByName: $(`#${ctlPrefix}LastModifiedByName`).val(),
             GeometryType: nullif($(`#${ctlPrefix}GeometryType`).val(), ""),
             Expiration: $(`#${ctlPrefix}Expiration`).prop("checked"),
             ExpirationOperation: parseInt($(`#${ctlPrefix}ExpirationOp`).val()),
             ExpirationDate: null,
-            CreatedBy: null
+            CreatedByName: $(`#${ctlPrefix}CreatedByName`).val()
         };
 
-        const selectedUpdateUser = $(`#${ctlPrefix}LastModifiedBy`).val();
+        const selectedUpdateUser = $(`#${ctlPrefix}LastModifiedByName`).val();
         if (nullif(selectedUpdateUser, "") !== null) {
-            s.LastModifiedBy = W.model.users.getObjectById(selectedUpdateUser).getAttribute('id');
+            s.LastModifiedByName = selectedUpdateUser;
         }
 
-        const selectedCreateUser = $(`#${ctlPrefix}CreatedBy`).val();
+        const selectedCreateUser = $(`#${ctlPrefix}CreatedByName`).val();
         if (nullif(selectedCreateUser, "") !== null) {
-            s.CreatedBy = W.model.users.getObjectById(selectedCreateUser).getAttribute('id');
+            s.CreatedByName = selectedCreateUser;
         }
 
         let pattern = $(`#${ctlPrefix}Title`).val();
@@ -532,20 +529,16 @@ namespace WMEWAL_MapComments {
 
             settings = getSettings();
 
-            if (settings.LastModifiedBy !== null) {
-                lastModifiedBy = W.model.users.getObjectById(settings.LastModifiedBy);
-                lastModifiedByName = lastModifiedBy.getAttribute('userName');
+            if (settings.LastModifiedByName !== null) {
+                lastModifiedByName = settings.LastModifiedByName;
             } else {
-                lastModifiedBy = null;
-                lastModifiedByName = null;
+                lastModifiedByName = "";
             }
 
-            if (settings.CreatedBy !== null) {
-                createdBy = W.model.users.getObjectById(settings.CreatedBy);
-                createdByName = createdBy.getAttribute('userName');
+            if (settings.CreatedByName !== null) {
+                createdByName = settings.CreatedByName;
             } else {
-                createdBy = null;
-                createdByName = null;
+                createdByName = "";
             }
 
             if (settings.TitleRegex !== null) {
@@ -578,11 +571,11 @@ namespace WMEWAL_MapComments {
         }
     }
 
-    function getPL(mapComment: IMapComment, lonlat: OpenLayers.LonLat): string {
-        return WMEWAL.GenerateBasePL(lonlat.lat, lonlat.lon, 5) + "&mode=0&mapComments=" + mapComment.id;
+    function getPL(mapComment: IMapComment, lonlat: LonLat): string {
+        return WMEWAL.GenerateBasePL(lonlat.lat, lonlat.lon, 17) + "&mode=0&mapComments=" + mapComment.id;
     }
 
-    export function ScanExtent(segments: Array<WazeNS.Model.Object.Segment>, venues: Array<WazeNS.Model.Object.Venue>): Promise<WMEWAL.IResult> {
+    export function ScanExtent(segments: Array<Segment>, venues: Array<Venue>): Promise<WMEWAL.IResult> {
         return new Promise(resolve => {
             setTimeout(function () {
                 let count = scan(segments, venues);
@@ -591,33 +584,35 @@ namespace WMEWAL_MapComments {
         });
     }
 
-    function scan(segments: Array<WazeNS.Model.Object.Segment>, venues: Array<WazeNS.Model.Object.Venue>): number {
-        for (let c in W.model.mapComments.objects) {
-            if (mc.indexOf(c) === -1) {
-                const mapComment = W.model.mapComments.getObjectById(c);
+    function scan(segments: Array<Segment>, venues: Array<Venue>): number {
+        const userrank = sdk.State.getUserInfo().rank;
+        const extentComments = sdk.DataModel.MapComments.getAll();
+        for (let ix = 0; ix < extentComments.length; ix++) {
+            const mapComment = extentComments[ix];
+            if (mc.indexOf(mapComment.id) === -1) {
                 if (mapComment != null) {
-                    mc.push(c);
+                    mc.push(mapComment.id);
 
                     if ((settings.LockLevel == null ||
-                        (settings.LockLevelOperation === Operation.Equal && (mapComment.getAttribute('lockRank') || 0) + 1 === settings.LockLevel) ||
-                        (settings.LockLevelOperation === Operation.NotEqual && (mapComment.getAttribute('lockRank') || 0) + 1 !== settings.LockLevel)) &&
-                        (!settings.EditableByMe || mapComment.arePropertiesEditable()) &&
-                        (settings.GeometryType == null || (settings.GeometryType === "point" && mapComment.isPoint()) || (settings.GeometryType === "area" && !mapComment.isPoint())) &&
-                        (titleRegex == null || titleRegex.test(mapComment.getAttribute('subject'))) &&
-                        ((settings.LastModifiedBy === null) ||
-                            ((mapComment.getUpdatedBy() ?? mapComment.getCreatedBy()) === settings.LastModifiedBy)) &&
-                        ((settings.CreatedBy === null) ||
-                            (mapComment.getCreatedBy() === settings.CreatedBy))) {
+                        (settings.LockLevelOperation === Operation.Equal && (mapComment.lockRank || 0) + 1 === settings.LockLevel) ||
+                        (settings.LockLevelOperation === Operation.NotEqual && (mapComment.lockRank || 0) + 1 !== settings.LockLevel)) &&
+                        (!settings.EditableByMe || mapComment.lockRank <= userrank /*mapComment.arePropertiesEditable()*/) &&
+                        (settings.GeometryType == null || (settings.GeometryType === "point" && mapComment.isPoint) || (settings.GeometryType === "area" && !mapComment.isPoint)) &&
+                        (titleRegex == null || titleRegex.test(mapComment.subject)) &&
+                        ((settings.LastModifiedByName == "") ||
+                            ((mapComment.modificationData.updatedBy ?? mapComment.modificationData.createdBy) == settings.LastModifiedByName)) &&
+                        ((settings.CreatedByName == "") ||
+                            (mapComment.modificationData.createdBy == settings.CreatedByName))) {
 
                         if (settings.Expiration) {
-                            if (mapComment.getAttribute('endDate') === null) {
+                            if (mapComment.endDate === null) {
                                 // If map comment doesn't have an end date, it automatically matches any greater than (or equal) filter
                                 // and automatically fails any less than (or equal) filter
                                 if (settings.ExpirationOperation === Operation.LessThan || settings.ExpirationOperation === Operation.LessThanOrEqual) {
                                     continue;
                                 }
                             } else {
-                                const endDateNumber = Date.parse(mapComment.getAttribute('endDate'));
+                                const endDateNumber = Date.parse(mapComment.endDate);
                                 if (isNaN(endDateNumber)) {
                                     continue;
                                 }
@@ -646,22 +641,12 @@ namespace WMEWAL_MapComments {
                             }
                         }
 
-                        // if (settings.LastModifiedBy != null) {
-                        //     if (mapComment.getAttribute('updatedBy') != null) {
-                        //         if (mapComment.getAttribute('updatedBy') !== settings.LastModifiedBy) {
-                        //             continue;
-                        //         }
-                        //     } else if (mapComment.getAttribute('createdBy') !== settings.LastModifiedBy) {
-                        //         continue;
-                        //     }
-                        // }
-
                         if (settings.CommentRegex != null) {
-                            let match = commentRegex.test(mapComment.getAttribute('body'));
+                            let match = commentRegex.test(mapComment.body);
 
-                            const comments = mapComment.getComments();
+                            const comments = mapComment.conversation;
                             for (let ixComment = 0; ixComment < comments.length; ixComment++ && !match) {
-                                match = commentRegex.test(comments.models[ixComment].attributes.text);
+                                match = commentRegex.test(comments[ixComment].text);
                             }
                             if (!match) {
                                 continue;
@@ -672,10 +657,9 @@ namespace WMEWAL_MapComments {
                             continue;
                         }
 
-                        const lastEditorID = mapComment.getUpdatedBy() ?? mapComment.getCreatedBy();
-                        const lastEditor = W.model.users.getObjectById(lastEditorID);
+                        const lastEditorName = mapComment.modificationData.updatedBy ?? mapComment.modificationData.createdBy;
                         let endDate: number = null;
-                        const expirationDate = mapComment.getAttribute('endDate');
+                        const expirationDate = mapComment.endDate;
                         if (expirationDate != null) {
                             endDate = Date.parse(expirationDate);
                             if (isNaN(endDate)) {
@@ -683,15 +667,15 @@ namespace WMEWAL_MapComments {
                             }
                         }
                         const mComment: IMapComment = {
-                            id: mapComment.getAttribute('id'),
-                            geometryType: ((mapComment.isPoint()) ? I18n.t("edit.venue.type.point") : I18n.t("edit.venue.type.area")),
-                            lastEditor: lastEditor?.getAttribute('userName') ?? '',
-                            title: mapComment.getAttribute('subject'),
-                            lockLevel: mapComment.getAttribute('lockRank') + 1,
+                            id: mapComment.id,
+                            geometryType: ((mapComment.isPoint) ? I18n.t("edit.venue.type.point") : I18n.t("edit.venue.type.area")),
+                            lastEditor: lastEditorName ?? '',
+                            title: mapComment.subject,
+                            lockLevel: mapComment.lockRank + 1,
                             expirationDate: endDate,
-                            center: mapComment.getAttribute('geometry').getCentroid(),
-                            createdOn: mapComment.getAttribute('createdOn'),
-                            updatedOn: mapComment.getAttribute('updatedOn')
+                            center: turf.centroid(mapComment.geometry),
+                            createdOn: mapComment.modificationData.createdOn,
+                            updatedOn: mapComment.modificationData.updatedOn
                         };
 
                         mapComments.push(mComment);
@@ -711,12 +695,12 @@ namespace WMEWAL_MapComments {
                 return a.title.localeCompare(b.title);
             });
 
-            const isCSV = (WMEWAL.outputTo & WMEWAL.OutputTo.CSV);
+            let isCSV: boolean = (WMEWAL.outputTo & WMEWAL.OutputTo.CSV) != 0;
             const isTab = (WMEWAL.outputTo & WMEWAL.OutputTo.Tab);
             const addBOM = WMEWAL.addBOM ?? false;
             const outputFields = WMEWAL.outputFields ?? ['CreatedEditor','LastEditor','LockLevel','Lat','Lon'];
             const includeLockLevel = outputFields.indexOf('LockLevel') > -1 || settings.LockLevel !== null;
-            const includeLastEditor = outputFields.indexOf('Last Editor') > -1 || settings.LastModifiedBy !== null;
+            const includeLastEditor = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedByName != '';
             const includeLat = outputFields.indexOf('Lat') > -1;
             const includeLon = outputFields.indexOf('Lon') > -1;
 
@@ -724,6 +708,13 @@ namespace WMEWAL_MapComments {
             let columnArray: Array<string>;
             let w: Window;
             let fileName: string;
+
+            if (isTab) {
+                w = window.open();
+                if (!w || !w.document) {
+                    isCSV = true; // force CSV if popup-blocker
+                }
+            }
             if (isCSV) {
                 lineArray = [];
                 columnArray = ["Title"];
@@ -747,8 +738,8 @@ namespace WMEWAL_MapComments {
                 fileName += ".csv";
             }
 
-            if (isTab) {
-                w = window.open();
+            if (isTab && w && w.document) {
+                //w = window.open();
                 w.document.write("<html><head><title>Map Comments</title></head><body>");
                 w.document.write("<h2>Area: " + WMEWAL.areaName + "</h2>");
                 w.document.write("<b>Filters</b>");
@@ -788,10 +779,10 @@ namespace WMEWAL_MapComments {
                     }
                     w.document.write(` ${new Date(settings.ExpirationDate).toString()}`);
                 }
-                if (settings.CreatedBy != null) {
+                if (settings.CreatedByName != '') {
                     w.document.write("<br/>Created by " + createdByName);
                 }
-                if (settings.LastModifiedBy != null) {
+                if (settings.LastModifiedByName != '') {
                     w.document.write("<br/>Last updated by " + lastModifiedByName);
                 }
                 if (settings.EditableByMe) {
@@ -817,7 +808,7 @@ namespace WMEWAL_MapComments {
 
             for (let ixmc = 0; ixmc < mapComments.length; ixmc++) {
                 const mapComment = mapComments[ixmc];
-                const lonlat = OpenLayers.Layer.SphericalMercator.inverseMercator(mapComment.center.x, mapComment.center.y);
+                const lonlat = { lon: mapComment.center.geometry.coordinates[0], lat: mapComment.center.geometry.coordinates[1] };
                 const pl = getPL(mapComment, lonlat);
                 let expirationDate: string = "";
                 if (mapComment.expirationDate != null) {
@@ -842,7 +833,7 @@ namespace WMEWAL_MapComments {
                     columnArray.push(`"${pl}"`);
                     lineArray.push(columnArray);
                 }
-                if (isTab) {
+                if (isTab && w && w.document) {
                     w.document.write(`<tr><td>${mapComment.title}</td>`);
                     if (includeLockLevel) {
                         w.document.write(`<td>${mapComment.lockLevel.toString()}</td>`);
@@ -880,7 +871,7 @@ namespace WMEWAL_MapComments {
                 document.body.removeChild(node);
             }
 
-            if (isTab) {
+            if (isTab && w && w.document) {
                 WMEWAL.writeErrText(w);
                 w.document.write("</tbody></table></body></html>");
                 w.document.close();
@@ -899,8 +890,8 @@ namespace WMEWAL_MapComments {
         let upd = false;
 
         if (settings !== null) {
-            if (!settings.hasOwnProperty("CreatedBy")) {
-                settings.CreatedBy = null;
+            if (!settings.hasOwnProperty("CreatedByName")) {
+                settings.CreatedByName = '';
                 upd =true;
             }
 
@@ -970,5 +961,4 @@ namespace WMEWAL_MapComments {
         }
     }
 
-    bootstrap();
 }

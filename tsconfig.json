@@ -2,7 +2,9 @@
     "compileOnSave": true,
     "compilerOptions": {
         "target": "ES2022",
-        "module": "commonJS",
-        "sourceMap": false
+        "module": "es2022",
+        "moduleResolution": "bundler",
+        "sourceMap": false,
+        "strictNullChecks": false
     }
 }

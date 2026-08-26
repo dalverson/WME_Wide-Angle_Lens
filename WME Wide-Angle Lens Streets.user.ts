@@ -1,12 +1,7 @@
-/// <reference path="../typescript-typings/globals/openlayers/index.d.ts" />
-/// <reference path="../typescript-typings/I18n.d.ts" />
-/// <reference path="../typescript-typings/waze.d.ts" />
-/// <reference path="../typescript-typings/globals/jquery/index.d.ts" />
 /// <reference path="WME Wide-Angle Lens.user.ts" />
-/// <reference path="../typescript-typings/greasyfork.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens Streets
-// @version             2026.04.22.001
+// @version             2026.08.26.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Find streets that match filter criteria
 // @author              vtpearce and crazycaveman
@@ -19,14 +14,19 @@
 // @copyright           2020 vtpearce
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
 // @updateURL           https://greasyfork.org/scripts/40646-wme-wide-angle-lens-streets/code/WME%20Wide-Angle%20Lens%20Streets.meta.js
 // @downloadURL         https://greasyfork.org/scripts/40646-wme-wide-angle-lens-streets/code/WME%20Wide-Angle%20Lens%20Streets.user.js
 // @connect             greasyfork.org
 // ==/UserScript==
-// @updateURL           https://greasyfork.org/en/scripts/418292-wme-wide-angle-lens-streets-beta/code/WME%20Wide-Angle%20Lens%20Streets.meta.js
-// @downloadURL         https://greasyfork.org/en/scripts/418292-wme-wide-angle-lens-streets-beta/code/WME%20Wide-Angle%20Lens%20Streets.user.js
+/* global turf, W, I18n, $, WazeWrap, WMEWAL */
 
-/*global W, OL, $, WazeWrap, WMEWAL, OpenLayers, I18n */
+import type { WmeSDK, Segment, Street, SegmentAddress, State, Venue, Node } from "wme-sdk-typings";
+import { GeoJsonProperties, Feature, Point, GeometryCollection, LineString } from 'geojson';
+import { geometryCollection } from "@turf/helpers";
+import { centroid } from "@turf/turf";
+
+declare var unsafeWindow: Window & typeof globalThis;
 
 namespace WMEWAL_Streets {
 
@@ -35,14 +35,14 @@ namespace WMEWAL_Streets {
     const DOWNLOAD_URL = GM_info.script.downloadURL;
 
     const updateText = '<ul>'
-        + '<li>Includes TTS Override text if has TTS is checked.</li>'
+        + '<li>SDK migration.</li>'
         + '</ul>';
     const greasyForkPage = 'https://greasyfork.org/scripts/40646';
     const wazeForumThread = 'https://www.waze.com/discuss/t/script-wme-wide-angle-lens/77807';
 
     const ctlPrefix = "_wmewalStreets";
 
-    const minimumWALVersionRequired = "2025.04.10.001";
+    const minimumWALVersionRequired = "2026.06.06.001";
 
     enum Direction {
         OneWay = 1,
@@ -129,7 +129,7 @@ namespace WMEWAL_Streets {
 
     interface ISegment {
         id: number;
-        center: OpenLayers.Geometry.Point;
+        center: Feature<Point>;
         type: string;
     }
 
@@ -152,12 +152,12 @@ namespace WMEWAL_Streets {
 
     interface IStreet extends IStreetBase {
         state: string;
-        geometries: OpenLayers.Geometry.Collection;
+        geometries: Feature<GeometryCollection<LineString>>;
         roadType: number;
         lockLevel: number;
         segments: Array<ISegment>;
         roundaboutId: number;
-        center?: OpenLayers.Geometry.Point;
+        center?: Feature<Point>;
         altStreets?: Array<IStreetBase>;
         direction: Direction;
         issues: number;
@@ -198,7 +198,7 @@ namespace WMEWAL_Streets {
         SegmentLengthOperation: Operation;
         SegmentLengthValue: number;
         SegmentLengthUnit: Unit;
-        LastModifiedBy: number;
+        LastModifiedByName: string;
         HasNoName: boolean;
         HasNoCity: boolean;
         NonNeutralRoutingPreference: boolean;
@@ -214,7 +214,7 @@ namespace WMEWAL_Streets {
         NearHOV: boolean;
         Toll: boolean;
         Beacons: boolean;
-        CreatedBy: number;
+        CreatedByName: string;
         LaneGuidance: boolean;
         LaneGuidanceOperation: number;
         Created: boolean;
@@ -225,7 +225,7 @@ namespace WMEWAL_Streets {
         UpdatedDate: number;
         Plus1RoutingPreference: boolean;
         Minus1RoutingPreference: boolean;
-        NewlyPaved: boolean;
+        //NewlyPaved: boolean;
         SegmentLengthFilter: boolean;
         SegmentLengthFilterOperation: Operation;
         SegmentLengthFilterValue: number;
@@ -286,12 +286,12 @@ namespace WMEWAL_Streets {
 
     const settingsKey = "WMEWALStreetsSettings";
     const savedSettingsKey = "WMEWALStreetsSavedSettings";
+    let sdk: WmeSDK;
     let settings: ISettings = null;
     let savedSettings: Array<ISavedSetting> = [];
     let streets: Array<IStreet> = null;
-    let state: WazeNS.Model.Object.State;
+    let state: State;
     let stateName: string;
-    let lastModifiedBy: WazeNS.Model.Object.User;
     let lastModifiedByName: string;
     let nameRegex: RegExp = null;
     let cityRegex: RegExp = null;
@@ -304,7 +304,6 @@ namespace WMEWAL_Streets {
     let roundabouts: Array<number> = null;
     let detectIssues = false;
     let initCount = 0;
-    let createdBy: WazeNS.Model.Object.User;
     let createdByName: string;
     let savedSegments: Array<number>;
     let segmentLengthMultiplier: number;
@@ -315,26 +314,25 @@ namespace WMEWAL_Streets {
     let segTTSOver: string;
     let scanHasTTS: boolean;
 
+    const sandboxed = typeof unsafeWindow !== 'undefined';
+    const pageWindow = sandboxed ? unsafeWindow : window;
+    pageWindow.SDK_INITIALIZED.then(() => {
+        onWmeReady();
+    });
+
     function onWmeReady() {
         initCount++;
         if (WazeWrap && WazeWrap.Ready && typeof(WMEWAL) !== 'undefined' && WMEWAL && WMEWAL.RegisterPlugIn) {
             log('debug','WazeWrap and WMEWAL ready.');
+            sdk = WMEWAL.sdk;
             init();
         } else {
             if (initCount < 60) {
                 log('debug','WazeWrap or WMEWAL not ready. Trying again...');
                 setTimeout(onWmeReady, 1000);
             } else {
-                log('error', 'WazeWrap or WMEWAL not ready. Giving up.');
+                log('error','WazeWrap or WMEWAL not ready. Giving up.');
             }
-        }
-    }
-
-    function bootstrap() {
-        if (W?.userscripts?.state.isReady) {
-            onWmeReady();
-        } else {
-            document.addEventListener('wme-ready', onWmeReady, { once: true });
         }
     }
 
@@ -371,7 +369,7 @@ namespace WMEWAL_Streets {
                 }
             }
         }
-        isImperial = W.prefs.attributes.isImperial;
+        isImperial = sdk.Settings.getUserSettings().isImperial;
 
         if (settings == null) {
             initSettings();
@@ -446,7 +444,7 @@ namespace WMEWAL_Streets {
             `<option value='${Direction.Unknown}'>Unknown</option></select></td></tr>`;
         html += "<tr><td><b>Created By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}CreatedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}CreatedByName'></select></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}Created' type='checkbox' class='wal-check'/>` +
             `<label for=${ctlPrefix}Created' class='wal-label'>Date Created:</label> ` +
             `<select id='${ctlPrefix}CreatedOp'>` +
@@ -459,7 +457,7 @@ namespace WMEWAL_Streets {
             `<input id='${ctlPrefix}CreatedDate' type='date'/> <input id='${ctlPrefix}CreatedTime' type='time'/></td></tr>`;
         html += "<tr><td><span style='color:red'>*</span><b>Last Updated By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}LastModifiedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}LastModifiedByName'></select></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}Updated' type='checkbox' class='wal-check'/>` +
             `<label for=${ctlPrefix}Updated' class='wal-label'><span style='color:red'>*</span>Date Updated:</label> ` +
             `<select id='${ctlPrefix}UpdatedOp'>` +
@@ -646,8 +644,8 @@ namespace WMEWAL_Streets {
             `<label for='${ctlPrefix}Plus1RoutingPreference' class='wal-label'>+1 routing preference</label></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}RampWithSL' type='checkbox' class='wal-check'/>` +
             `<label for='${ctlPrefix}RampWithSL' class='wal-label'>Ramp with speed limit</label></td></tr>`;
-        html += `<tr><td><input id='${ctlPrefix}NewlyPaved' type='checkbox' class='wal-check'/>` +
-            `<label for='${ctlPrefix}NewlyPaved' class='wal-label'>Newly paved</label></td></tr>`;
+//        html += `<tr><td><input id='${ctlPrefix}NewlyPaved' type='checkbox' class='wal-check'/>` +
+//            `<label for='${ctlPrefix}NewlyPaved' class='wal-label'>Newly paved</label></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}HasClosures' type='checkbox' class='wal-check'/>` +
             `<label for='${ctlPrefix}HasClosures' class='wal-label'>Has closures</label></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}Loop' type='checkbox' class='wal-check'/>` +
@@ -718,17 +716,17 @@ namespace WMEWAL_Streets {
         loadScriptUpdateMonitor();
 
         updateStates();
-        updateUsers($(`#${ctlPrefix}LastModifiedBy`));
-        updateUsers($(`#${ctlPrefix}CreatedBy`));
+        updateUsers($(`#${ctlPrefix}LastModifiedByName`));
+        updateUsers($(`#${ctlPrefix}CreatedByName`));
         updateUI();
         updateSavedSettingsList();
 
         $(`#${ctlPrefix}State`).on("focus", updateStates);
-        $(`#${ctlPrefix}LastModifiedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}LastModifiedBy`));
+        $(`#${ctlPrefix}LastModifiedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}LastModifiedByName`));
         });
-        $(`#${ctlPrefix}CreatedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}CreatedBy`));
+        $(`#${ctlPrefix}CreatedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}CreatedByName`));
         });
         $(`#${ctlPrefix}RoadTypeAny`).on("click", function () {
             $(`input[data-group=${ctlPrefix}RoadType]`).prop("checked", true);
@@ -758,13 +756,14 @@ namespace WMEWAL_Streets {
         const stateObjs: Array<IState> = [];
         stateObjs.push({id: null, name: "" });
 
-        for (let s in W.model.states.objects) {
-            if (W.model.states.objects.hasOwnProperty(s)) {
-                const st = W.model.states.getObjectById(parseInt(s));
-                if (st.getAttribute('id') !== 1 && st.getAttribute('name') !== "") {
-                    stateObjs.push({ id: st.getAttribute('id'), name: st.getAttribute('name') });
+        const stlist = sdk.DataModel.States.getAll();
+        for (let s in stlist) {
+
+                const st = stlist[s];
+                if (st.id !== 1 && st.name !== "") {
+                    stateObjs.push({ id: st.id, name: st.name });
                 }
-            }
+
         }
 
         stateObjs.sort(function (a, b) {
@@ -788,7 +787,7 @@ namespace WMEWAL_Streets {
 
     function updateUsers(selectUsernameList: JQuery): void {
         // Preserve current selection
-        const currentId: number = parseInt(selectUsernameList.val());
+        const currentUser: string = selectUsernameList.val();
 
         selectUsernameList.empty();
 
@@ -814,9 +813,9 @@ namespace WMEWAL_Streets {
 
         for (let ix = 0; ix < userObjs.length; ix++) {
             const o = userObjs[ix];
-            const userOption = $("<option/>").text(o.name).attr("value", o.id);
+            const userOption = $("<option/>").text(o.name).attr("value", o.name);
 
-            if (currentId != null && o.id == null) {
+            if (currentUser != null && o.id == null) {
                 userOption.attr("selected", "selected");
             }
             selectUsernameList.append(userOption);
@@ -881,7 +880,7 @@ namespace WMEWAL_Streets {
         $(`#${ctlPrefix}SegmentLengthOperation`).val(settings.SegmentLengthOperation || Operation.LessThan.toString());
         $(`#${ctlPrefix}SegmentLengthValue`).val(settings.SegmentLengthValue ?? "");
         $(`#${ctlPrefix}SegmentLengthUnit`).val(settings.SegmentLengthUnit || Unit.Metric.toString());
-        $(`#${ctlPrefix}LastModifiedBy`).val(settings.LastModifiedBy);
+        $(`#${ctlPrefix}LastModifiedByName`).val(settings.LastModifiedByName);
         $(`#${ctlPrefix}HasNoName`).prop("checked", settings.HasNoName);
         $(`#${ctlPrefix}HasNoCity`).prop("checked", settings.HasNoCity);
         $(`#${ctlPrefix}HasNoCityOperation`).val(settings.HasNoCityOperation || PrimaryOrAlt.Either.toString());
@@ -896,7 +895,7 @@ namespace WMEWAL_Streets {
         $(`#${ctlPrefix}NearHOV`).prop("checked", settings.NearHOV);
         $(`#${ctlPrefix}Toll`).prop("checked", settings.Toll);
         $(`#${ctlPrefix}Beacons`).prop("checked", settings.Beacons);
-        $(`#${ctlPrefix}CreatedBy`).val(settings.CreatedBy);
+        $(`#${ctlPrefix}CreatedByName`).val(settings.CreatedByName);
         $(`#${ctlPrefix}LaneGuidance`).prop("checked", settings.LaneGuidance);
         $(`#${ctlPrefix}LaneGuidanceOp`).val(settings.LaneGuidanceOperation);
         $(`#${ctlPrefix}Created`).prop("checked", settings.Created);
@@ -923,7 +922,7 @@ namespace WMEWAL_Streets {
             $(`#${ctlPrefix}UpdatedDate`).val("");
             $(`#${ctlPrefix}UpdatedTime`).val("");
         }
-        $(`#${ctlPrefix}NewlyPaved`).prop("checked", settings.NewlyPaved);
+//        $(`#${ctlPrefix}NewlyPaved`).prop("checked", settings.NewlyPaved);
         $(`#${ctlPrefix}SegmentLengthFilter`).prop("checked", settings.SegmentLengthFilter);
         $(`#${ctlPrefix}SegmentLengthFilterOperation`).val(settings.SegmentLengthFilterOperation || Operation.LessThan.toString());
         $(`#${ctlPrefix}SegmentLengthFilterValue`).val(settings.SegmentLengthFilterValue ?? "");
@@ -999,13 +998,13 @@ namespace WMEWAL_Streets {
             addMessage("Invalid state selection");
         }
 
-        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedBy`).val();
-        if (nullif(selectedModifiedUser, "") !== null && s.LastModifiedBy === null) {
+        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedByName`).val();
+        if (nullif(selectedModifiedUser, "") !== null && s.LastModifiedByName === null) {
             addMessage("Invalid last modified user");
         }
 
-        const selectedCreatedUser = $(`#${ctlPrefix}CreatedBy`).val();
-        if (nullif(selectedCreatedUser, "") !== null && s.CreatedBy === null) {
+        const selectedCreatedUser = $(`#${ctlPrefix}CreatedByName`).val();
+        if (nullif(selectedCreatedUser, "") !== null && s.CreatedByName === null) {
             addMessage("Invalid created user");
         }
 
@@ -1179,7 +1178,7 @@ namespace WMEWAL_Streets {
             SegmentLengthOperation: parseInt($(`#${ctlPrefix}SegmentLengthOperation`).val()),
             SegmentLengthValue: null,
             SegmentLengthUnit: parseInt($(`#${ctlPrefix}SegmentLengthUnit`).val()),
-            LastModifiedBy: null,
+            LastModifiedByName: $(`#${ctlPrefix}LastModifiedByName`).val(),
             HasNoName: $(`#${ctlPrefix}HasNoName`).prop("checked"),
             HasNoCity: $(`#${ctlPrefix}HasNoCity`).prop("checked"),
             HasNoCityOperation: parseInt($(`#${ctlPrefix}HasNoCityOperation`).val()),
@@ -1193,7 +1192,7 @@ namespace WMEWAL_Streets {
             NearHOV: $(`#${ctlPrefix}NearHOV`).prop("checked"),
             Toll: $(`#${ctlPrefix}Toll`).prop("checked"),
             Beacons: $(`#${ctlPrefix}Beacons`).prop("checked"),
-            CreatedBy: null,
+            CreatedByName: $(`#${ctlPrefix}CreatedByName`).val(),
             LaneGuidance: $(`#${ctlPrefix}LaneGuidance`).prop("checked"),
             LaneGuidanceOperation: parseInt($(`#${ctlPrefix}LaneGuidanceOp`).val()),
             Created: $(`#${ctlPrefix}Created`).prop("checked"),
@@ -1204,7 +1203,7 @@ namespace WMEWAL_Streets {
             UpdatedDate: null,
             Minus1RoutingPreference: $(`#${ctlPrefix}Minus1RoutingPreference`).prop("checked"),
             Plus1RoutingPreference: $(`#${ctlPrefix}Plus1RoutingPreference`).prop("checked"),
-            NewlyPaved: $(`#${ctlPrefix}NewlyPaved`).prop("checked"),
+            //NewlyPaved: false, // $(`#${ctlPrefix}NewlyPaved`).prop("checked"),
             SegmentLengthFilter: $(`#${ctlPrefix}SegmentLengthFilter`).prop("checked"),
             SegmentLengthFilterOperation: parseInt($(`#${ctlPrefix}SegmentLengthFilterOperation`).val()),
             SegmentLengthFilterValue: null,
@@ -1251,26 +1250,26 @@ namespace WMEWAL_Streets {
 
         const selectedState: string = $(`#${ctlPrefix}State`).val();
         if (nullif(selectedState, "") !== null) {
-            const state = W.model.states.getObjectById(parseInt(selectedState));
+            const state = sdk.DataModel.States.getById( { stateId: parseInt(selectedState)} );
             if (state != null) {
-                s.State = state.getID();
+                s.State = state.id;
             }
         }
 
-        const selectedUpdateUser: string = $(`#${ctlPrefix}LastModifiedBy`).val();
+        const selectedUpdateUser: string = $(`#${ctlPrefix}LastModifiedByName`).val();
         if (nullif(selectedUpdateUser, "") !== null) {
-            const u = W.model.users.getObjectById(parseInt(selectedUpdateUser));
-            if (u != null) {
-                s.LastModifiedBy = u.getAttribute('id');
-            }
+            //const u = W.model.users.getObjectById(parseInt(selectedUpdateUser));
+            //if (u != null) {
+                s.LastModifiedByName = selectedUpdateUser;
+            //}
         }
 
-        const selectedCreateUser: string = $(`#${ctlPrefix}CreatedBy`).val();
+        const selectedCreateUser: string = $(`#${ctlPrefix}CreatedByName`).val();
         if (nullif(selectedCreateUser, "") !== null) {
-            const u = W.model.users.getObjectById(parseInt(selectedCreateUser));
-            if (u != null) {
-                s.CreatedBy = u.getAttribute('id');
-            }
+            //const u = W.model.users.getObjectById(parseInt(selectedCreateUser));
+            //if (u != null) {
+                s.CreatedByName = selectedCreateUser;
+            //}
         }
 
         let pattern = $(`#${ctlPrefix}Name`).val();
@@ -1382,27 +1381,27 @@ namespace WMEWAL_Streets {
             settings = getSettings();
 
             if (settings.State !== null) {
-                state = W.model.states.getObjectById(settings.State);
-                stateName = state.getAttribute('name');
+                state = sdk.DataModel.States.getById( {stateId: settings.State});
+                stateName = state.name;
             } else {
                 state = null;
                 stateName = null;
             }
 
-            if (settings.LastModifiedBy !== null) {
-                lastModifiedBy = W.model.users.getObjectById(settings.LastModifiedBy);
-                lastModifiedByName = lastModifiedBy.getAttribute('userName');
+            if (settings.LastModifiedByName !== null) {
+                //lastModifiedBy = W.model.users.getObjectById(settings.LastModifiedBy);
+                lastModifiedByName = settings.LastModifiedByName; //lastModifiedBy.getAttribute('userName');
             } else {
-                lastModifiedBy = null;
-                lastModifiedByName = null;
+                //lastModifiedBy = null;
+                lastModifiedByName = "";
             }
 
-            if (settings.CreatedBy !== null) {
-                createdBy = W.model.users.getObjectById(settings.CreatedBy);
-                createdByName = createdBy.getAttribute('userName');
+            if (settings.CreatedByName !== null) {
+                //createdByName = W.model.users.getObjectById(settings.CreatedBy);
+                createdByName = settings.CreatedByName //.getAttribute('userName');
             } else {
-                createdBy = null;
-                createdByName = null;
+                //createdBy = null;
+                createdByName = "";
             }
 
             if (settings.Regex !== null) {
@@ -1498,7 +1497,7 @@ namespace WMEWAL_Streets {
                 || settings.RampWithSL
                 || settings.Minus1RoutingPreference
                 || settings.Plus1RoutingPreference
-                || settings.NewlyPaved
+//                || settings.NewlyPaved
                 || settings.OneWay
                 || settings.HasClosures
                 || settings.HasTIO
@@ -1518,7 +1517,7 @@ namespace WMEWAL_Streets {
         return allOk;
     }
 
-    export function ScanExtent(segments: Array<WazeNS.Model.Object.Segment>, venues: Array<WazeNS.Model.Object.Venue>,
+    export function ScanExtent(segments: Array<Segment>, venues: Array<Venue>,
         suggestedSegments: Array<WazeNS.Model.Object.SegmentSuggestion>): Promise<WMEWAL.IResult> {
         return new Promise(resolve => {
             setTimeout(function () {
@@ -1528,52 +1527,64 @@ namespace WMEWAL_Streets {
         });
     }
 
-    function scan(segments: Array<WazeNS.Model.Object.Segment>, venues: Array<WazeNS.Model.Object.Venue>, suggestedSegments: Array<WazeNS.Model.Object.SegmentSuggestion>): number {
+    function scan(segments: Array<Segment>, venues: Array<Venue>, suggestedSegments: Array<WazeNS.Model.Object.SegmentSuggestion>): number {
         const extentStreets: Array<IStreet> = [];
-        let segment: WazeNS.Model.Object.Segment;
+        let segment: Segment;
         let suggestedSegment: WazeNS.Model.Object.SegmentSuggestion;
         let directions: string[];
         const outputFields: Array<string> = WMEWAL.outputFields ?? ['CreatedEditor','LastEditor','LockLevel','Lat','Lon'];
         const includeLockLevel = outputFields.indexOf('LockLevel') > -1 || settings.LockLevel !== null;
-        const includeLastEditor = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedBy !== null;
-        const includeCreatedEditor = outputFields.indexOf('CreatedEditor') > -1 || settings.CreatedBy !== null;
+        const includeLastEditor = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedByName !== null;
+        const includeCreatedEditor = outputFields.indexOf('CreatedEditor') > -1 || settings.CreatedByName !== null;
 
-        function determineDirection(s: WazeNS.Model.Object.Segment | WazeNS.Model.Object.SegmentSuggestion): Direction {
-            return (s.getAttribute('fwdDirection') ? (s.getAttribute('revDirection') ? Direction.TwoWay : Direction.OneWay) : (s.getAttribute('revDirection') ? Direction.OneWay : Direction.Unknown));
+        function determineDirection(s: Segment /*| WazeNS.Model.Object.SegmentSuggestion*/ ): Direction {
+            return s.isTwoWay ? Direction.TwoWay : ((s.isAtoB || s.isBtoA) ? Direction.OneWay : Direction.Unknown);
+        }
+        function getNodeByDirection(seg: Segment, dir: string): Node {
+            let nid;
+            if (dir == 'to') nid = seg.toNodeId;
+            else nid = seg.fromNodeId
+            return sdk.DataModel.Nodes.getById({nodeId: nid});
+        }
+        function getWNodeByDirection(seg: Segment, dir: string): WazeNS.Feature.Vector.Node {
+            let nid;
+            if (dir == 'to') nid = seg.toNodeId;
+            else nid = seg.fromNodeId
+            return W.model.nodes.getObjectById( nid);
         }
 
-        function addSegment(s: WazeNS.Model.Object.Segment, rId: number, issues: number, newSegment: boolean): void {
+        function addSegment(s: Segment, rId: number, issues: number, newSegment: boolean): void {
             // Don't add this segment if we've already scanned it
-            if (savedSegments.indexOf(s.getID()) === -1 ) {
-                savedSegments.push(s.getID());
-                const sid = s.getAttribute('primaryStreetID');
-                const lastEditorID = s.getUpdatedBy() ?? s.getCreatedBy();
-                const lastEditor = W.model.users.getObjectById(lastEditorID);
-                const createdEditorID = s.getCreatedBy();
-                const createdEditor = W.model.users.getObjectById(createdEditorID);
-                const address = s.getAddress(W.model);
+            if (savedSegments.indexOf(s.id) === -1 ) {
+                savedSegments.push(s.id);
+                //const lastEditorID = s.getUpdatedBy() ?? s.getCreatedBy();
+                const lastEditor = s.modificationData.updatedBy; // W.model.users.getObjectById(lastEditorID);
+                //const createdEditorID = s.getCreatedBy();
+                const createdEditor = s.modificationData.createdBy;  //W.model.users.getObjectById(createdEditorID);
+                const address = sdk.DataModel.Segments.getAddress( {segmentId: s.id}); //s.getAddress(W.model);
+                const sid = s.primaryStreetId;
                 let thisStreet: IStreet = null;
-                const ps = includeShields ? W.model.streets.getObjectById(sid) : null;
+                const ps = includeShields ? sdk.DataModel.Streets.getById( { streetId: sid}) : null;
                 if (sid != null && !newSegment) {
                     thisStreet = extentStreets.find(function (e) {
                         let matches = (e.id === sid && e.roundaboutId === rId &&
-                            e.roadType === s.getAttribute('roadType') && e.issues === issues &&
-                            (ps == null || (e.shieldText === (ps.getAttribute('signText') || '') && e.shieldDirection === (ps.getAttribute('direction') || ''))));
+                            e.roadType === s.roadType && e.issues === issues &&
+                            (ps == null || (e.shieldText === (ps.signText || '') && e.shieldDirection === (ps.direction || ''))));
                         if (includeLockLevel) {
-                            matches &&= (e.lockLevel === (s.getAttribute('lockRank') | 0) + 1);
+                            matches &&= (e.lockLevel === (s.lockRank | 0) + 1);
                         }
                         if (includeLastEditor) {
-                            matches &&= e.lastEditor === (lastEditor?.getAttribute('userName') ?? 'WMEWALNotFound');
+                            matches &&= e.lastEditor === lastEditor;
                         }
                         if (includeCreatedEditor) {
-                            matches &&= e.createdEditor === (createdEditor?.getAttribute('userName') ?? 'WMEWALNotFound');
+                            matches &&= e.createdEditor === createdEditor;
                         }
                         if (matches && settings.IncludeAltNames) {
                             // Test for alt names
                             for (let ixAlt = 0; ixAlt < e.altStreets.length && matches; ixAlt++) {
                                 matches = false;
-                                for (let ixSegAlt = 0; ixSegAlt < s.getAttribute('streetIDs').length && !matches; ixSegAlt++) {
-                                    if (e.altStreets[ixAlt].id === s.getAttribute('streetIDs')[ixSegAlt]) {
+                                for (let ixSegAlt = 0; ixSegAlt < s.alternateStreetIds.length && !matches; ixSegAlt++) {
+                                    if (e.altStreets[ixAlt].id === s.alternateStreetIds[ixSegAlt]) {
                                         matches = true;
                                     }
                                 }
@@ -1589,44 +1600,44 @@ namespace WMEWAL_Streets {
                 if (thisStreet == null) {
                     thisStreet = {
                         id: sid,
-                        city: ((address && !address.attributes.isEmpty && address.attributes.city.hasName()) ? address.attributes.city.getAttribute('name') : "No City"),
-                        state: ((address && !address.attributes.isEmpty) ? address.attributes.state.getAttribute('name') : "No State"),
-                        name: ((address && !address.attributes.isEmpty && !address.attributes.street.getAttribute('isEmpty')) ? address.attributes.street.getAttribute('name') : null),
-                        geometries: new OpenLayers.Geometry.Collection(),
-                        lockLevel: (s.getAttribute('lockRank') || 0) + 1,
+                        city: ((address && !address.isEmpty && !address.city.isEmpty) ? address.city.name : "No City"),
+                        state: ((address && !address.isEmpty) ? address.state.name : "No State"),
+                        name: ((address && !address.isEmpty && !address.street.isEmpty) ? address.street.name : null),
+                        geometries: turf.geometryCollection([s.geometry]),
+                        lockLevel: (s.lockRank || 0) + 1,
                         segments: [],
                         roundaboutId: rId,
                         altStreets: [],
-                        roadType: s.getAttribute('roadType'),
+                        roadType: s.roadType,
                         direction: determineDirection(s),
                         issues: issues,
-                        length: s.getAttribute('length') * (isImperial ? mToFt : 1.0),
-                        lastEditor: (lastEditor && lastEditor.getAttribute('userName')) || "",
-                        asc: (s.getFlagAttribute('fwdSpeedCamera') || s.getFlagAttribute('revSpeedCamera') ? 'Yes' : 'No'),
-                        createdEditor: (createdEditor && createdEditor.getAttribute('userName')) || "",
-                        shieldText: ps != null ? ps.getAttribute('signText') || '' : '',
-                        shieldDirection: ps != null ? ps.getAttribute('direction') || '' : '',
+                        length: s.length * (isImperial ? mToFt : 1.0),
+                        lastEditor: (lastEditor) || "",
+                        asc: (s.flagAttributes.fwdSpeedCamera || s.flagAttributes.revSpeedCamera ? 'Yes' : 'No'),
+                        createdEditor: (createdEditor ) || "",
+                        shieldText: ps != null ? ps.signText || '' : '',
+                        shieldDirection: ps != null ? ps.direction || '' : '',
                         type: 'segment',
                         rejectionReason: null,
                         ttsOverrides: ''
                     };
 
                     if (settings.IncludeAltNames) {
-                        if (s.getAttribute('streetIDs') != null) {
-                            for (let ixAlt = 0; ixAlt < s.getAttribute('streetIDs').length; ixAlt++) {
-                                if (s.getAttribute('streetIDs')[ixAlt] != null) {
-                                    const altStreet = W.model.streets.getObjectById(s.getAttribute('streetIDs')[ixAlt]);
+                        if (s.alternateStreetIds != null) {
+                            for (let ixAlt = 0; ixAlt < s.alternateStreetIds.length; ixAlt++) {
+                                if (s.alternateStreetIds[ixAlt] != null) {
+                                    const altStreet = sdk.DataModel.Streets.getById( { streetId: s.alternateStreetIds[ixAlt]});
                                     if (altStreet != null) {
                                         let altCityName: string = null;
-                                        if (altStreet.getAttribute('cityID') != null) {
-                                            let altCity = W.model.cities.getObjectById(altStreet.getAttribute('cityID'));
+                                        if (altStreet.cityId != null) {
+                                            let altCity = sdk.DataModel.Cities.getById( {cityId: altStreet.cityId});
                                             if (altCity != null) {
-                                                altCityName = altCity.hasName() ? altCity.getAttribute('name') : "No city";
+                                                altCityName = !altCity.isEmpty ? altCity.name : "No city";
                                             }
                                         }
                                         thisStreet.altStreets.push({
-                                            id: s.getAttribute('streetIDs')[ixAlt],
-                                            name: altStreet.getAttribute('name'),
+                                            id: s.alternateStreetIds[ixAlt],
+                                            name: altStreet.name,
                                             city: altCityName,
                                             type: 'segment'
                                         });
@@ -1637,18 +1648,20 @@ namespace WMEWAL_Streets {
                     }
                     extentStreets.push(thisStreet);
                 }
+                else {
+                thisStreet.geometries.geometry.geometries.push(s.geometry);
+                }
 
                 thisStreet.segments.push({
-                    id: s.getAttribute('id'),
-                    center: s.getAttribute('geometry').getCentroid(),
+                    id: s.id,
+                    center:  turf.centroid(s.geometry),  //s.getAttribute('geometry').getCentroid(),
                     type: 'segment'
                 });
-                thisStreet.geometries.addComponents([s.getAttribute('geometry').clone()]);
                 thisStreet.ttsOverrides += segTTSOver;
 
             }
         }
-
+/* disable this for now
         function addSuggestedSegment(s: WazeNS.Model.Object.SegmentSuggestion): void {
             // Don't add this segment if we've already scanned it
             if (savedSegments.indexOf(s.getID()) === -1 ) {
@@ -1670,7 +1683,7 @@ namespace WMEWAL_Streets {
                     segments: [],
                     roundaboutId: null,
                     altStreets: [],
-                    roadType: s.getAttribute('roadType'),
+                    roadType: s.roadType,
                     direction: determineDirection(s),
                     issues: null,
                     length: null,
@@ -1686,14 +1699,14 @@ namespace WMEWAL_Streets {
 
                 thisStreet.segments.push({
                     id: s.getID(),
-                    center: s.getAttribute('geometry').getCentroid(),
+                    center: turf.centroid(s.geometry),
                     type: 'suggestedsegment'
                 });
-                thisStreet.geometries.addComponents([s.getAttribute('geometry').clone()]);
+                thisStreet.geometries.addComponents([s.geometry.clone()]);
 
                 extentStreets.push(thisStreet);
             }
-        }
+        } */
 
         const graph = W.model.getTurnGraph();
 
@@ -1701,42 +1714,49 @@ namespace WMEWAL_Streets {
             for (let ix = 0; ix < segments.length; ix++) {
                 segment = segments[ix];
                 if (segment != null) {
-                    const attr = segment.getFlagAttributes();
+                    const attr = segment.flagAttributes;
                     segTTSOver = '';
+                    let hasLG = false;
+                    if (settings.LaneGuidance) {
+                        const turns = sdk.DataModel.Turns.getTurnsFromSegment( { segmentId: segment.id});
+                        for (let t=0; t<turns.length; t++) {
+                            if (turns[t].hasTurnGuidance) hasLG = true;
+                        }
+                    }
 
-                    if ((WMEWAL.WazeRoadTypeToRoadTypeBitmask(segment.getAttribute('roadType')) & settings.RoadTypeMask) &&
+                    if ((WMEWAL.WazeRoadTypeToRoadTypeBitmask(segment.roadType) & settings.RoadTypeMask) &&
                         (settings.LockLevel == null ||
-                            (settings.LockLevelOperation === Operation.Equal && (segment.getAttribute('lockRank') || 0) + 1 === settings.LockLevel) ||
-                            (settings.LockLevelOperation === Operation.NotEqual && (segment.getAttribute('lockRank') || 0) + 1 !== settings.LockLevel)) &&
-                        (!settings.EditableByMe || segment.arePropertiesEditable()) &&
-                        (!settings.ExcludeJunctionBoxes || !segment.isInBigJunction()) &&
+                            (settings.LockLevelOperation === Operation.Equal && (segment.lockRank || 0) + 1 === settings.LockLevel) ||
+                            (settings.LockLevelOperation === Operation.NotEqual && (segment.lockRank || 0) + 1 !== settings.LockLevel)) &&
+                        (!settings.EditableByMe || sdk.DataModel.Segments.hasPermissions({segmentId: segment.id})) &&
+                        (!settings.ExcludeJunctionBoxes || !sdk.DataModel.Segments.connectsToBigJunction({segmentId: segment.id})) &&
                         (settings.Direction == null || determineDirection(segment) === settings.Direction) &&
                         (!settings.Unpaved || attr.unpaved) &&
                         (!settings.Tunnel || attr.tunnel) &&
                         (!settings.HeadlightsRequired || attr.headlights) &&
                         (!settings.NearHOV || attr.nearbyHOV) &&
                         (!settings.Beacons || attr.beacons) &&
-                        (!settings.Toll || segment.isTollRoad()) &&
-                        (!settings.LaneGuidance || (settings.LaneGuidanceOperation === 0 && (segment.isLanesEnabled(0) || segment.isLanesEnabled(1))) || (settings.LaneGuidanceOperation === 1 && !segment.isLanesEnabled(0) && !segment.isLanesEnabled(1))) &&
+                        (!settings.Toll || sdk.DataModel.Segments.isTollSegment({segmentId: segment.id})) && 
+                        (!settings.LaneGuidance || (settings.LaneGuidanceOperation === 0 && hasLG) || (settings.LaneGuidanceOperation === 1 && !hasLG)) &&
                         (!settings.Created ||
-                            (settings.CreatedOperation === Operation.LessThan && segment.getAttribute('createdOn') < settings.CreatedDate) ||
-                            (settings.CreatedOperation === Operation.LessThanOrEqual && segment.getAttribute('createdOn') <= settings.CreatedDate) ||
-                            (settings.CreatedOperation === Operation.GreaterThan && segment.getAttribute('createdOn') > settings.CreatedDate) ||
-                            (settings.CreatedOperation === Operation.GreaterThanOrEqual && segment.getAttribute('createdOn') >= settings.CreatedDate)) &&
+                            (settings.CreatedOperation === Operation.LessThan && segment.modificationData.createdOn < settings.CreatedDate) ||
+                            (settings.CreatedOperation === Operation.LessThanOrEqual && segment.modificationData.createdOn <= settings.CreatedDate) ||
+                            (settings.CreatedOperation === Operation.GreaterThan && segment.modificationData.createdOn > settings.CreatedDate) ||
+                            (settings.CreatedOperation === Operation.GreaterThanOrEqual && segment.modificationData.createdOn >= settings.CreatedDate)) &&
                         (!settings.Updated ||
-                            (settings.UpdatedOperation === Operation.LessThan && segment.getAttribute('updatedOn') < settings.UpdatedDate) ||
-                            (settings.UpdatedOperation === Operation.LessThanOrEqual && segment.getAttribute('updatedOn') <= settings.UpdatedDate) ||
-                            (settings.UpdatedOperation === Operation.GreaterThan && segment.getAttribute('updatedOn') > settings.UpdatedDate) ||
-                            (settings.UpdatedOperation === Operation.GreaterThanOrEqual && segment.getAttribute('updatedOn') >= settings.UpdatedDate)) &&
+                            (settings.UpdatedOperation === Operation.LessThan && segment.modificationData.updatedOn < settings.UpdatedDate) ||
+                            (settings.UpdatedOperation === Operation.LessThanOrEqual && segment.modificationData.updatedOn <= settings.UpdatedDate) ||
+                            (settings.UpdatedOperation === Operation.GreaterThan && segment.modificationData.updatedOn > settings.UpdatedDate) ||
+                            (settings.UpdatedOperation === Operation.GreaterThanOrEqual && segment.modificationData.updatedOn >= settings.UpdatedDate)) &&
                         (!settings.SegmentLengthFilter ||
-                            (settings.SegmentLengthFilterOperation === Operation.LessThan && (segment.getAttribute('length') * segmentLengthFilterMultipier) < settings.SegmentLengthFilterValue) ||
-                            (settings.SegmentLengthFilterOperation === Operation.LessThanOrEqual && (segment.getAttribute('length') * segmentLengthFilterMultipier) <= settings.SegmentLengthFilterValue) ||
-                            (settings.SegmentLengthFilterOperation === Operation.GreaterThan && (segment.getAttribute('length') * segmentLengthFilterMultipier) > settings.SegmentLengthFilterValue) ||
-                            (settings.SegmentLengthFilterOperation === Operation.GreaterThanOrEqual && (segment.getAttribute('length') * segmentLengthFilterMultipier) >= settings.SegmentLengthFilterValue)) &&
-                        ((settings.CreatedBy === null) ||
-                            (segment.getCreatedBy() === settings.CreatedBy)) &&
-                        ((settings.LastModifiedBy === null) ||
-                            ((segment.getUpdatedBy() ?? segment.getCreatedBy()) === settings.LastModifiedBy))) {
+                            (settings.SegmentLengthFilterOperation === Operation.LessThan && (segment.length * segmentLengthFilterMultipier) < settings.SegmentLengthFilterValue) ||
+                            (settings.SegmentLengthFilterOperation === Operation.LessThanOrEqual && (segment.length * segmentLengthFilterMultipier) <= settings.SegmentLengthFilterValue) ||
+                            (settings.SegmentLengthFilterOperation === Operation.GreaterThan && (segment.length * segmentLengthFilterMultipier) > settings.SegmentLengthFilterValue) ||
+                            (settings.SegmentLengthFilterOperation === Operation.GreaterThanOrEqual && (segment.length * segmentLengthFilterMultipier) >= settings.SegmentLengthFilterValue)) &&
+                        ((!settings.CreatedByName ) ||
+                            (segment.modificationData.createdBy === settings.CreatedByName)) &&
+                        ((!settings.LastModifiedByName) ||
+                            ((segment.modificationData.updatedBy ?? segment.modificationData.createdBy) === settings.LastModifiedByName))) {
 
                         if (!WMEWAL.IsSegmentInArea(segment)) {
                             continue;
@@ -1744,18 +1764,18 @@ namespace WMEWAL_Streets {
 
                         let newSegment = false;
 
-                        let primaryStreet: WazeNS.Model.Object.Street = null;
-                        const primaryStreetID = segment.getAttribute('primaryStreetID');
+                        let primaryStreet: Street = null;
+                        const primaryStreetID = segment.primaryStreetId;
                         if (primaryStreetID !== null) {
-                            primaryStreet = W.model.streets.getObjectById(primaryStreetID);
+                            primaryStreet = sdk.DataModel.Streets.getById( { streetId: primaryStreetID});
                         }
 
                         let issues = 0;
-                        const address = segment.getAddress(W.model);
+                        const address = sdk.DataModel.Segments.getAddress( {segmentId: segment.id});
                         if (state != null) {
-                            if (!(address?.attributes?.isEmpty ?? true) && address.attributes.state != null) {
-                                if (settings.StateOperation === Operation.Equal && address.attributes.state.getAttribute('id') !== state.getAttribute('id') ||
-                                    settings.StateOperation === Operation.NotEqual && address.attributes.state.getAttribute('id') === state.getAttribute('id')) {
+                            if (!(address?.isEmpty ?? true) && address.state != null) {
+                                if (settings.StateOperation === Operation.Equal && address.state.id !== state.id ||
+                                    settings.StateOperation === Operation.NotEqual && address.state.id === state.id) {
                                         continue;
                                 }
 
@@ -1763,35 +1783,37 @@ namespace WMEWAL_Streets {
                                 continue;
                             }
                         }
+                        const nodeA = sdk.DataModel.Nodes.getById({nodeId: segment.fromNodeId});
+                        const nodeB = sdk.DataModel.Nodes.getById({nodeId: segment.toNodeId});
 
                         let primaryAddrMatches = true;
                         let altAddrMatches: boolean[] = [];
-                        const hasAltNames = segment.getAttribute('streetIDs')?.length ?? 0 > 0;
+                        const hasAltNames = segment.alternateStreetIds?.length ?? 0 > 0;
 
                         if (nameRegex != null || cityRegex != null) {
                             let anyNameMatched = true;
 
                             if (nameRegex != null) {
-                                anyNameMatched = !(address?.attributes?.isEmpty ?? true) && !(address.attributes.street?.getAttribute('isEmpty') ?? true) && nameRegex.test(address.attributes.street.getAttribute('name'));
+                                anyNameMatched = !(address?.isEmpty ?? true) && !(address.street?.isEmpty ?? true) && nameRegex.test(address.street.name);
                             }
                             if (cityRegex != null) {
-                                anyNameMatched = anyNameMatched && (address.attributes.city?.hasName() ?? false) && cityRegex.test(address.attributes.city.getAttribute('name'));
+                                anyNameMatched = anyNameMatched && (!address.city.isEmpty ) && cityRegex.test(address.city.name);
                             }
                             primaryAddrMatches = anyNameMatched;
 
                             if (settings.IncludeAltNames && hasAltNames) {
-                                for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length; streetIx++) {
+                                for (let streetIx = 0; streetIx < segment.alternateStreetIds.length; streetIx++) {
                                     let altMatched = true;
-                                    if (segment.getAttribute('streetIDs')[streetIx] != null) {
-                                        const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
-                                        if (!(street?.attributes?.isEmpty ?? true)) {
+                                    if (segment.alternateStreetIds[streetIx] != null) {
+                                        const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
+                                        if (!(street?.isEmpty ?? true)) {
                                             if (nameRegex != null) {
-                                                altMatched = nameRegex.test(street.getAttribute('name'));
+                                                altMatched = nameRegex.test(street.name);
                                             }
                                             if (cityRegex != null) {
-                                                if (street.getAttribute('cityID') != null) {
-                                                    const city = W.model.cities.getObjectById(street.getAttribute('cityID'));
-                                                    altMatched = altMatched && (city?.hasName() ?? false) && cityRegex.test(city.getAttribute('name'));
+                                                if (street.cityId != null) {
+                                                    const city = sdk.DataModel.Cities.getById( {cityId: street.cityId});
+                                                    altMatched = altMatched && city && (city.isEmpty==false) && cityRegex.test(city.name);
                                                 } else {
                                                     altMatched = false;
                                                 }
@@ -1811,34 +1833,34 @@ namespace WMEWAL_Streets {
                                 continue;
                             }
                         } else if (settings.IncludeAltNames && hasAltNames) {
-                            altAddrMatches = new Array(segment.getAttribute('streetIDs').length).fill(true);
+                            altAddrMatches = new Array(segment.alternateStreetIds.length).fill(true);
                         }
 
                         if (intersectingNameRegex !== null) {
                             directions = [];
-                            if (segment.getAttribute('fwdDirection')) {
+                            if (segment.isAtoB) {
                                 directions.push('to');
                             }
-                            if (segment.getAttribute('revDirection')) {
+                            if (segment.isBtoA) {
                                 directions.push('from');
                             }
                             let anyConnectedNameMatched = false;
                             for (let ixDir = 0; ixDir < directions.length && !anyConnectedNameMatched; ixDir++) {
-                                const connectedSegments = segment.getConnectedSegmentsByDirection(W.model, directions[ixDir]);
+                                const connectedSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection: directions[ixDir]=='from'});
                                 for (let ixSeg = 0; ixSeg < connectedSegments.length && !anyConnectedNameMatched; ixSeg++) {
                                     // Don't look at segments that have the same primary street ID
-                                    if (connectedSegments[ixSeg].getAttribute('primaryStreetID') != primaryStreetID) {
-                                        const connectedSegment = W.model.segments.getObjectById(connectedSegments[ixSeg].getAttribute('id'));
-                                        const connectedAddress = connectedSegment?.getAddress(W.model);
-                                        anyConnectedNameMatched = anyConnectedNameMatched || !(connectedAddress?.attributes?.isEmpty ?? true) && !(connectedAddress.attributes.street?.getAttribute('isEmpty') ?? true) && intersectingNameRegex.test(connectedAddress.attributes.street.getAttribute('name'));
+                                    if (connectedSegments[ixSeg].primaryStreetId != primaryStreetID) {
+                                        const connectedSegment = sdk.DataModel.Segments.getById( {segmentId: connectedSegments[ixSeg].id});
+                                        const connectedAddress = sdk.DataModel.Segments.getAddress({segmentId: connectedSegment.id});
+                                        anyConnectedNameMatched = anyConnectedNameMatched || !(connectedAddress?.isEmpty ?? true) && !(connectedAddress.street?.isEmpty ?? true) && intersectingNameRegex.test(connectedAddress.street.name);
 
-                                        if (settings.IncludeAltNames && (connectedSegment.getAttribute('streetIDs')?.length ?? 0) > 0) {
-                                            for (let streetIx = 0; streetIx < connectedSegment.getAttribute('streetIDs').length && !anyConnectedNameMatched; streetIx++) {
+                                        if (settings.IncludeAltNames && (connectedSegment.alternateStreetIds?.length ?? 0) > 0) {
+                                            for (let streetIx = 0; streetIx < connectedSegment.alternateStreetIds.length && !anyConnectedNameMatched; streetIx++) {
                                                 let altMatched = true;
-                                                if (connectedSegment.getAttribute('streetIDs')[streetIx] != null) {
-                                                    let street = W.model.streets.getObjectById(connectedSegment.getAttribute('streetIDs')[streetIx]);
-                                                    if (!(street?.attributes?.isEmpty ?? true)) {
-                                                        altMatched = intersectingNameRegex.test(street.getAttribute('name'));
+                                                if (connectedSegment.alternateStreetIds[streetIx] != null) {
+                                                    let street = sdk.DataModel.Streets.getById( { streetId: connectedSegment.alternateStreetIds[streetIx]});
+                                                    if (!(street?.isEmpty ?? true)) {
+                                                        altMatched = intersectingNameRegex.test(street.name);
                                                     } else {
                                                         altMatched = false;
                                                     }
@@ -1864,24 +1886,24 @@ namespace WMEWAL_Streets {
                             let anyShieldMatches = true;
 
                             if (shieldTextRegex != null) {
-                                anyShieldMatches = primaryStreet?.attributes?.signText != null && shieldTextRegex.test(primaryStreet.getAttribute('signText'));
+                                anyShieldMatches = primaryStreet?.signText != null && shieldTextRegex.test(primaryStreet.signText);
                             }
                             if (shieldDirectionRegex != null) {
-                                anyShieldMatches = anyShieldMatches && primaryStreet?.attributes?.direction != null && shieldDirectionRegex.test(primaryStreet.getAttribute('direction'));
+                                anyShieldMatches = anyShieldMatches && primaryStreet?.direction != null && shieldDirectionRegex.test(primaryStreet.direction);
                             }
 
                             primaryShieldMatches = anyShieldMatches;
 
                             if (settings.IncludeAltNames && hasAltNames) {
-                                for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length; streetIx++) {
+                                for (let streetIx = 0; streetIx < segment.alternateStreetIds.length; streetIx++) {
                                     let altMatched = true;
-                                    if (segment.getAttribute('streetIDs')[streetIx] != null) {
-                                        const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
+                                    if (segment.alternateStreetIds[streetIx] != null) {
+                                        const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
                                         if (shieldTextRegex != null) {
-                                            altMatched = street?.attributes?.signText != null && shieldTextRegex.test(street.getAttribute('signText'));
+                                            altMatched = street?.signText != null && shieldTextRegex.test(street.signText);
                                         }
                                         if (shieldDirectionRegex != null) {
-                                            altMatched = altMatched && street?.attributes?.direction != null && shieldDirectionRegex.test(street.getAttribute('direction'));
+                                            altMatched = altMatched && street?.direction != null && shieldDirectionRegex.test(street.direction);
                                         }
                                     } else {
                                         altMatched = false;
@@ -1895,26 +1917,28 @@ namespace WMEWAL_Streets {
                                 continue;
                             }
                         } else if (settings.IncludeAltNames && hasAltNames) {
-                            altShieldMatches = new Array(segment.getAttribute('streetIDs').length).fill(true);
+                            altShieldMatches = new Array(segment.alternateStreetIds.length).fill(true);
                         }
 
                         if (viRegex !== null || towardsRegex !== null || ttsRegex !== null) {
                             let instructionMatches = false;
                             directions = [];
-                            if (segment.getAttribute('fwdDirection')) {
+                            if (segment.isAtoB || segment.isTwoWay) {
                                 directions.push('to');
                             }
-                            if (segment.getAttribute('revDirection')) {
+                            if (segment.isBtoA || segment.isTwoWay) {
                                 directions.push('from');
                             }
+                            const osegment = W.model.segments.getObjectById(segment.id);
                             for (let ixDir = 0; ixDir < directions.length && !instructionMatches; ixDir++) {
-                                const node = segment.getNodeByDirection(directions[ixDir]);
-                                const connectedSegments = segment.getConnectedSegmentsByDirection(W.model, directions[ixDir]);
+                                const node = getWNodeByDirection(segment, directions[ixDir]);
+                                const connectedSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection: directions[ixDir]=='from'});
                                 for (let ixSeg = 0; ixSeg < connectedSegments.length && !instructionMatches; ixSeg++) {
-                                    if (settings.EditableByMe && !connectedSegments[ixSeg].arePropertiesEditable()) {
+                                    if (settings.EditableByMe && !sdk.DataModel.Segments.hasPermissions({segmentId:connectedSegments[ixSeg].id})) {
                                         continue;
                                     }
-                                    const turn = graph.getTurnThroughNode(node, segment, connectedSegments[ixSeg]).getTurnData();
+                                    const oconseg = W.model.segments.getObjectById(connectedSegments[ixSeg].id);
+                                    const turn = graph.getTurnThroughNode(node, osegment, oconseg).getTurnData();
                                     if (turn.hasTurnGuidance()) {
                                         const tg = turn.getTurnGuidance();
 
@@ -1925,6 +1949,8 @@ namespace WMEWAL_Streets {
                                             instructionMatches = true;
                                         }
                                         if (ttsRegex !== null && nullif(tg.getTTS(), '') !== null && ttsRegex.test(tg.getTTS())) {
+                                            segTTSOver += tg.getTTS() + ' | ';
+                                            scanHasTTS = true;
                                             instructionMatches = true;
                                         }
                                     }
@@ -1939,18 +1965,18 @@ namespace WMEWAL_Streets {
                         }
 
                         let noPrimaryCity = true;
-                        if (address && !address.isEmpty() && !address.getCity().isEmpty() && address.getCity().hasName()) {
+                        if (address && !address.isEmpty && !address.city.isEmpty /*&& address.getCity().hasName()*/ ) {
                             noPrimaryCity = false;
                         }
 
                         let noAltCity = true;
                         if (hasAltNames) {
-                            for (let ixAlt = 0; ixAlt < segment.getAttribute('streetIDs').length; ixAlt++) {
-                                if (segment.getAttribute('streetIDs')[ixAlt] != null) {
-                                    const altStreet = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[ixAlt]);
-                                    if (altStreet != null && altStreet.getAttribute('cityID') != null) {
-                                        const altCity = W.model.cities.getObjectById(altStreet.getAttribute('cityID'));
-                                        if (altCity != null && !altCity.isEmpty() && altCity.hasName()) {
+                            for (let ixAlt = 0; ixAlt < segment.alternateStreetIds.length; ixAlt++) {
+                                if (segment.alternateStreetIds[ixAlt] != null) {
+                                    const altStreet = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[ixAlt]});
+                                    if (altStreet != null && altStreet.cityId != null) {
+                                        const altCity = sdk.DataModel.Cities.getById( {cityId: altStreet.cityId});
+                                        if (altCity != null && !altCity.isEmpty && altCity.name) {
                                             noAltCity = false;
                                             break;
                                         }
@@ -1960,19 +1986,19 @@ namespace WMEWAL_Streets {
                         }
 
                         if (settings.NoSpeedLimit &&
-                            ((segment.getAttribute('fwdDirection') && (segment.getAttribute('fwdMaxSpeed') == null || segment.getAttribute('fwdMaxSpeedUnverified'))) ||
-                            (segment.getAttribute('revDirection') && (segment.getAttribute('revMaxSpeed') == null || segment.getAttribute('revMaxSpeedUnverified'))))) {
+                            ((segment.isAtoB && (segment.fwdSpeedLimit == null || segment.isFwdSpeedLimitVerified)) ||
+                            (segment.isBtoA && (segment.revSpeedLimit == null || segment.isRevSpeedLimitVerified)))) {
                             issues = issues | Issue.NoSpeedLimit;
                         }
 
                         let hasExpiredRestrictions = false;
-                        if ((settings.HasTimeBasedRestrictions || settings.ExpiredRestrictions) && segment.getDrivingRestrictionCount() > 0) {
+                        if ((settings.HasTimeBasedRestrictions || settings.ExpiredRestrictions) && segment.restrictions.length > 0) {
                             if (settings.HasTimeBasedRestrictions) {
                                 issues = issues | Issue.TimeBasedRestrictions;
                             }
                             if (settings.ExpiredRestrictions) {
-                                for (const r of segment.getDrivingRestrictions()) {
-                                    hasExpiredRestrictions = r.isExpired() && !r.isRepeatsYearly();
+                                for (const r of segment.restrictions) {
+                                    hasExpiredRestrictions = r.isExpired /* && !r.isRepeatsYearly()*/;
                                     if (hasExpiredRestrictions) {
                                         break;
                                     }
@@ -1984,15 +2010,21 @@ namespace WMEWAL_Streets {
                             directions = ["from", "to"];
                             let hasTurnRestrictions = false;
                             for (const direction of directions) {
-                                const node = segment.getNodeByDirection(direction);
-                                const connSegments = segment.getConnectedSegmentsByDirection(W.model, direction);
+                                const node = getNodeByDirection(segment, direction);
+                                const connSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection:  direction=='from'});
                                 for (const connSegment of connSegments) {
-                                    const turn = graph.getTurnThroughNode(node, segment, connSegment);
-                                    if ((turn?.getTurnData()?.getRestrictions()?.length ?? 0) > 0) {
+                                    //const turn = graph.getTurnThroughNode(node, segment, connSegment);
+                                    let turns;
+                                    if (direction == 'from')
+                                        turns = sdk.DataModel.Turns.getTurnsFromSegment( { segmentId: segment.id});
+                                    else
+                                        turns = sdk.DataModel.Turns.getTurnsToSegment( { segmentId: segment.id});
+                                    let turn = turns[0];
+                                    if ((turn?.restrictions.length ?? 0) > 0) {
                                         hasTurnRestrictions = true;
                                         if (settings.ExpiredRestrictions && !hasExpiredRestrictions) {
-                                            for (const r of turn.getTurnData().getRestrictions()) {
-                                                hasExpiredRestrictions = r.isExpired();
+                                            for (const r of turn.restrictions) {
+                                                hasExpiredRestrictions = r.isExpired;
                                                 if (hasExpiredRestrictions) {
                                                     break;
                                                 }
@@ -2014,18 +2046,31 @@ namespace WMEWAL_Streets {
                         }
 
                         if (settings.HasRestrictedJunctionArrow) {
-                            directions = ["from", "to"];
+                            directions = ["from", "to" ];
                             let hasRestrictedTurns = false;
                             for (let ixDir = 0; ixDir < directions.length && !hasRestrictedTurns; ixDir++) {
-                                const node = segment.getNodeByDirection(directions[ixDir]);
-                                if (node) {
-                                    const keys = node.allConnectionKeys();
-                                    for (let ixLegal = 0; ixLegal < keys.legal.length && !hasRestrictedTurns; ixLegal++) {
-                                        if (keys.legal[ixLegal].from.getAttribute('id') === segment.getAttribute('id') &&
-                                            keys.legal[ixLegal].to.isDrivable() &&
-                                            !segment.isTurnAllowed(W.model, keys.legal[ixLegal].to, node)) {
+                                let turns;
+                                let nid = 0;
+                                if (directions[ixDir] == 'from' && (segment.isTwoWay || segment.isBtoA))
+                                    nid = segment.fromNodeId;
+                                    //turns = sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: segment.fromNodeId });
+                                    //turns = sdk.DataModel.Turns.getTurnsFromSegment({ segmentId: segment.id });
+                                else if (directions[ixDir] == 'to' && (segment.isTwoWay || segment.isAtoB))
+                                    nid = segment.toNodeId;
+                                    //turns = sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: segment.toNodeId });
+                                    //turns = sdk.DataModel.Turns.getTurnsToSegment({ segmentId: segment.id });
+                                if (nid > 0) turns = sdk.DataModel.Turns.getTurnsThroughNode({ nodeId: nid });
+                                //const node = getNodeByDirection(segment, directions[ixDir]);
+                                if (turns && turns.length > 0) {
+                                    //log('info', `seg ${segment.id} node ${nid} dir ${directions[ixDir]}`);
+                                    for (let ix = 0; ix < turns.length && !hasRestrictedTurns; ix++) {
+                                        const t = turns[ix];
+                                        //log('info', `  ix ${ix} from ${t.fromSegmentId} ${t.fromSegmentFwd} allow ${t.isAllowed}  to ${t.toSegmentId} ${t.toSegmentFwd}`);
+                                        if (t.fromSegmentId == segment.id && !t.isAllowed && !t.isUTurn) {
+                                            const othseg = sdk.DataModel.Segments.getById({ segmentId: t.toSegmentId });
+                                            if (othseg && othseg.isDrivable && (othseg.isTwoWay || (othseg.isAtoB && t.toSegmentFwd) || (othseg.isBtoA && !t.toSegmentFwd)))
                                                 hasRestrictedTurns = true;
-                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2044,51 +2089,74 @@ namespace WMEWAL_Streets {
                         if (settings.OneWay && determineDirection(segment) == Direction.OneWay) {
                             issues |= Issue.OneWay;
                         }
+                        if (settings.HasSoftTurns && ((!segment.areFwdTurnsVerified && nodeB.connectedSegmentIds.length > 1) 
+                                || (!segment.areRevTurnsVerified && nodeA.connectedSegmentIds.length > 1))) {
+                            issues = issues | Issue.SoftTurns;
+                            newSegment = true;
+                        }
 
-                        if (settings.HasUTurn
-                            || settings.HasSoftTurns) {
-                            directions = ["from", "to"];
+                        if (settings.HasUTurn) {
+                            directions = ["from" /*, "to"*/];
                             let hasUTurn = false;
-                            let hasSoftTurns = false;
                             // let hasUnnecessaryJunctionNode = false;
                             for (let ixDir = 0; ixDir < directions.length; ixDir++) {
-                                const node = segment.getNodeByDirection(directions[ixDir]);
+                                /*const node = getNodeByDirection(segment, directions[ixDir]);
                                 if (node) {
-                                    hasUTurn = hasUTurn || (node.connectionsExist() && segment.isTurnAllowed(W.model, segment, node));
                                     hasSoftTurns = hasSoftTurns || (node.connectionsExist() && !segment.areTurnsLocked(node));
+                                } */
+                                let turns;
+                                if (directions[ixDir] == 'from')
+                                    turns = sdk.DataModel.Turns.getTurnsFromSegment( { segmentId: segment.id});
+                                else
+                                    turns = sdk.DataModel.Turns.getTurnsToSegment( { segmentId: segment.id});
+                                
+                                let fwdCnt =0, revCnt = 0;
+                                let fwdUturn = false, revUturn = false;
+                                for (let it=0; it<turns.length; it++){
+                                    let turn = turns[it];
+                                    if (turn) {
+                                        if (turn.fromSegmentFwd) {
+                                            fwdCnt++
+                                            if (turn.isUTurn) fwdUturn = true;
+                                        } else {
+                                            revCnt++
+                                            if (turn.isUTurn) revUturn = true;
+                                        }
+                                        //hasUTurn = hasUTurn || turn.isUTurn;
+                                    }
+                                }
+                                if ((fwdUturn && fwdCnt > 1) || (revUturn && revCnt > 1) ) {
+                                    hasUTurn = true;
                                 }
                             }
                             if (hasUTurn && settings.HasUTurn) {
                                 issues = issues | Issue.UTurn;
                                 newSegment = true;
                             }
-                            if (hasSoftTurns && settings.HasSoftTurns) {
-                                issues = issues | Issue.SoftTurns;
-                                newSegment = true;
-                            }
+
                         }
 
                         if (settings.Elevation) {
-                            if ((settings.ElevationOperation  === Operation.LessThan && segment.getAttribute('level') < 0) ||
-                                (settings.ElevationOperation === Operation.GreaterThan && segment.getAttribute('level') > 0) ||
-                                (settings.ElevationOperation === Operation.NotEqual && segment.getAttribute('level') !== 0)) {
+                            if ((settings.ElevationOperation  === Operation.LessThan && segment.elevationLevel < 0) ||
+                                (settings.ElevationOperation === Operation.GreaterThan && segment.elevationLevel > 0) ||
+                                (settings.ElevationOperation === Operation.NotEqual && segment.elevationLevel !== 0)) {
                                 issues = issues | Issue.Elevation;
                             }
                         }
 
                         if (settings.SegmentLength) {
-                            if ((settings.SegmentLengthOperation === Operation.LessThan && (segment.getAttribute('length') * segmentLengthMultiplier) < settings.SegmentLengthValue) ||
-                                (settings.SegmentLengthOperation === Operation.LessThanOrEqual && (segment.getAttribute('length') * segmentLengthMultiplier) <= settings.SegmentLengthValue) ||
-                                (settings.SegmentLengthOperation === Operation.GreaterThan && (segment.getAttribute('length') * segmentLengthMultiplier) > settings.SegmentLengthValue) ||
-                                (settings.SegmentLengthOperation === Operation.GreaterThanOrEqual && (segment.getAttribute('length') * segmentLengthMultiplier) >= settings.SegmentLengthValue)) {
+                            if ((settings.SegmentLengthOperation === Operation.LessThan && (segment.length * segmentLengthMultiplier) < settings.SegmentLengthValue) ||
+                                (settings.SegmentLengthOperation === Operation.LessThanOrEqual && (segment.length * segmentLengthMultiplier) <= settings.SegmentLengthValue) ||
+                                (settings.SegmentLengthOperation === Operation.GreaterThan && (segment.length * segmentLengthMultiplier) > settings.SegmentLengthValue) ||
+                                (settings.SegmentLengthOperation === Operation.GreaterThanOrEqual && (segment.length * segmentLengthMultiplier) >= settings.SegmentLengthValue)) {
                                     issues = issues | Issue.SegmentLength;
                                     newSegment = true;
                                 }
                         }
 
                         if (settings.HasNoName) {
-                            if (!address || !address.attributes || address.attributes.isEmpty || !address.attributes.street || address.attributes.street.getAttribute('isEmpty') ||
-                                address.attributes.street.getAttribute('name') === null || address.attributes.street.getAttribute('name').trim().length === 0) {
+                            if (!address || address.isEmpty || !address.street || address.street.isEmpty ||
+                                address.street.name === null || address.street.name.trim().length === 0) {
                                 issues = issues | Issue.NoName;
                             }
                         }
@@ -2105,43 +2173,43 @@ namespace WMEWAL_Streets {
                             }
                         }
 
-                        if ((settings.Minus1RoutingPreference || settings.Plus1RoutingPreference) && segment.getAttribute('routingRoadType') !== null) {
-                            const originalRoutingPreference = WMEWAL.WazeRoadTypeToRoutingPreference(segment.getAttribute('roadType'));
-                            const routingRoadTypePreference = WMEWAL.WazeRoadTypeToRoutingPreference(segment.getAttribute('routingRoadType'));
+                        if ((settings.Minus1RoutingPreference || settings.Plus1RoutingPreference) && segment.routingRoadType !== null) {
+                            const originalRoutingPreference = WMEWAL.WazeRoadTypeToRoutingPreference(segment.roadType);
+                            const routingRoadTypePreference = WMEWAL.WazeRoadTypeToRoutingPreference(segment.routingRoadType);
                             if (settings.Minus1RoutingPreference && originalRoutingPreference > routingRoadTypePreference) {
                                 issues |= Issue.Minus1RoutingPreference;
                             }
                             if (settings.Plus1RoutingPreference && originalRoutingPreference < routingRoadTypePreference) {
                                 issues |= Issue.Plus1RoutingPreference;
                             }
-                            // if (segment.getAttribute('routingRoadType') != null && segment.getAttribute('routingRoadType') != segment.getAttribute('roadType')) {
+                            // if (segment.routingRoadType != null && segment.routingRoadType != segment.roadType) {
                             //     issues = issues | Issue.RoutingPreference;
                             // }
                         }
 
-                        if (settings.NoHN && !segment.getAttribute('hasHNs')) {
+                        if (settings.NoHN && !segment.hasHouseNumbers) {
                             issues |= Issue.NoHN;
                         }
 
-                        if (settings.HouseNumbersWithNoCity && segment.getAttribute('hasHNs') && noPrimaryCity && noAltCity) {
+                        if (settings.HouseNumbersWithNoCity && segment.hasHouseNumbers && noPrimaryCity && noAltCity) {
                             issues |= Issue.HouseNumbersWithNoCity;
                         }
 
-                        if (settings.RampWithSL && WMEWAL.WazeRoadTypeToRoadTypeBitmask(segment.getAttribute('roadType')) == WMEWAL.RoadType.Ramp &&
-                            ((segment.getAttribute('fwdDirection') && segment.getAttribute('fwdMaxSpeed') != null) ||
-                            (segment.getAttribute('revDirection') && segment.getAttribute('revMaxSpeed') != null))) {
+                        if (settings.RampWithSL && WMEWAL.WazeRoadTypeToRoadTypeBitmask(segment.roadType) == WMEWAL.RoadType.Ramp &&
+                            ((segment.isAtoB && segment.fwdSpeedLimit != null) ||
+                            (segment.isBtoA && segment.revSpeedLimit != null))) {
                             issues |= Issue.RampWithSL;
                         }
 
-                        if (settings.NewlyPaved && segment.getAttribute('validated') === false) {
+                        /*if (settings.NewlyPaved && segment.getAttribute('validated') === false) {
                             issues |= Issue.NewlyPaved;
-                        }
+                        } */
 
-                        if (settings.HasClosures && segment.getAttribute('hasClosures')) {
+                        if (settings.HasClosures && segment.hasClosures) {
                             issues |= Issue.HasClosures;
                         }
 
-                        if (settings.RedRoad && segment.getAttribute('primaryStreetID') === null) {
+                        if (settings.RedRoad && segment.primaryStreetId === null) {
                             issues |= Issue.RedRoad;
                         }
 
@@ -2152,13 +2220,14 @@ namespace WMEWAL_Streets {
                             let hasExit = false;
                             let anyConnectedSegments = false;
                             const dirs: string[] = [];
-                            if (segment.getAttribute('fwdDirection')) {
+                            const osegment = W.model.segments.getObjectById(segment.id);
+                            if (segment.isAtoB || segment.isTwoWay) {
                                 if (viRegex !== null || towardsRegex !== null) {
                                     dirs.push('to');
                                 }
                                 dirs.push(settings.TIDirection === IncomingOrOutgoing.Outgoing ? 'to' : 'from');
                             }
-                            if (segment.getAttribute('revDirection')) {
+                            if (segment.isBtoA || segment.isTwoWay) {
                                 if (viRegex !== null || towardsRegex !== null) {
                                     dirs.push('from');
                                 }
@@ -2166,19 +2235,24 @@ namespace WMEWAL_Streets {
                             }
                             let directions = [...new Set(dirs)];
                             for (let ixDir = 0; ixDir < directions.length; ixDir++) {
-                                const node = segment.getNodeByDirection(directions[ixDir]);
-                                const connectedSegments = segment.getConnectedSegmentsByDirection(W.model, directions[ixDir]);
+                                const node = getNodeByDirection(segment, directions[ixDir]);
+                                const connectedSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection:  directions[ixDir]=='from'});
                                 for (let ixSeg = 0; ixSeg < connectedSegments.length && !hasTIO; ixSeg++) {
                                     const connectedSegment = connectedSegments[ixSeg];
-                                    if (settings.EditableByMe && !connectedSegment.arePropertiesEditable()) {
+                                    const oconnSegment = W.model.segments.getObjectById(connectedSegment.id);
+                                    if (settings.EditableByMe && !sdk.DataModel.Segments.hasPermissions({segmentId: connectedSegment.id})) {
                                         continue;
                                     }
                                     anyConnectedSegments = true;
+                                    const onode: WazeNS.Feature.Vector.Node = W.model.nodes.getObjectById(node.id);
                                     let turn: WazeNS.Model.Graph.TurnData;
                                     if (settings.TIDirection === IncomingOrOutgoing.Outgoing) {
-                                        turn = graph.getTurnThroughNode(node, segment, connectedSegment).getTurnData();
+                                        //turn = graph.getTurnThroughNode(onode, osegment, oconnSegment).getTurnData();
+                                        turn = W.model.turnGraph.getTurnThroughNode(onode, osegment, oconnSegment).turnData;
+
                                     } else {
-                                        turn = graph.getTurnThroughNode(node, connectedSegment, segment).getTurnData();
+                                        //turn = graph.getTurnThroughNode(onode, oconnSegment, osegment).getTurnData();
+                                        turn = W.model.turnGraph.getTurnThroughNode(onode, oconnSegment, osegment).turnData;
                                     }
                                     if (settings.HasTIO && turn.hasInstructionOpcode() && (settings.TIO == TIO.Any || turn.getInstructionOpcode() == settings.TIO)) {
                                         hasTIO = true;
@@ -2236,15 +2310,15 @@ namespace WMEWAL_Streets {
                             }
                         }
 
-                        if (settings.Loop && !segment.isInRoundabout()) {
-                            const fromSegments = segment.getConnectedSegmentsByDirection(W.model, "from");
-                            const toSegments = segment.getConnectedSegmentsByDirection(W.model, "to");
+                        if (settings.Loop && !segment.junctionId) {
+                            const fromSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection: true /* "from"*/ });
+                            const toSegments = sdk.DataModel.Segments.getConnectedSegments({segmentId: segment.id, reverseDirection: false /* "to"*/ });
                             let hasLoop = false;
 
                             for (let ixFrom = 0; ixFrom < fromSegments.length && !hasLoop; ixFrom++) {
                                 for (let ixTo = 0; ixTo < toSegments.length && !hasLoop; ixTo++) {
-                                    if (fromSegments[ixFrom].getAttribute('id') == toSegments[ixTo].getAttribute('id') ||
-                                        fromSegments[ixFrom].getAttribute('id') == segment.getAttribute('id')) {
+                                    if (fromSegments[ixFrom].id == toSegments[ixTo].id ||
+                                        fromSegments[ixFrom].id == segment.id) {
                                         issues |= Issue.Loop;
                                         hasLoop = true;
                                     }
@@ -2255,13 +2329,13 @@ namespace WMEWAL_Streets {
                         if (settings.Shield) {
                             if (settings.ShieldOperation === HasOrMissing.Missing) {
                                 let missingShield = primaryAddrMatches &&
-                                    (primaryStreet?.attributes?.signType == null ||
-                                    nullif(primaryStreet?.attributes?.signText, '') == null);
+                                    (primaryStreet?.signType == null ||
+                                    nullif(primaryStreet?.signText, '') == null);
                                 if (settings.IncludeAltNames && hasAltNames) {
-                                    for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length && !missingShield; streetIx++) {
-                                        if (altAddrMatches[streetIx] && segment.getAttribute('streetIDs')[streetIx] != null) {
-                                            const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
-                                            missingShield = street?.attributes?.signType == null || nullif(street?.attributes?.signText , '') == null;
+                                    for (let streetIx = 0; streetIx < segment.alternateStreetIds.length && !missingShield; streetIx++) {
+                                        if (altAddrMatches[streetIx] && segment.alternateStreetIds[streetIx] != null) {
+                                            const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
+                                            missingShield = street?.signType == null || nullif(street?.signText , '') == null;
                                         }
                                     }
                                 }
@@ -2270,14 +2344,14 @@ namespace WMEWAL_Streets {
                                     issues |= Issue.Shield;
                                 }
                             } else if (settings.ShieldOperation === HasOrMissing.Has) {
-                                let hasShield = primaryAddrMatches && primaryShieldMatches && primaryStreet?.attributes?.signType != null && nullif(primaryStreet?.attributes?.signText, '') != null;
+                                let hasShield = primaryAddrMatches && primaryShieldMatches && primaryStreet?.signType != null && nullif(primaryStreet?.signText, '') != null;
 
                                 if (settings.IncludeAltNames && hasAltNames) {
-                                    for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length && !hasShield; streetIx++) {
-                                        if (altAddrMatches[streetIx] && altShieldMatches[streetIx] && segment.getAttribute('streetIDs')[streetIx] != null) {
-                                            const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
-                                            hasShield = street?.attributes?.signType != null &&
-                                                nullif(street?.attributes?.signText, '') != null;
+                                    for (let streetIx = 0; streetIx < segment.alternateStreetIds.length && !hasShield; streetIx++) {
+                                        if (altAddrMatches[streetIx] && altShieldMatches[streetIx] && segment.alternateStreetIds[streetIx] != null) {
+                                            const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
+                                            hasShield = street?.signType != null &&
+                                                nullif(street?.signText, '') != null;
                                         }
                                     }
                                 }
@@ -2290,13 +2364,13 @@ namespace WMEWAL_Streets {
 
                         if (settings.ShieldDirection) {
                             if (settings.ShieldDirectionOperation === HasOrMissing.Missing) {
-                                let missingDirection = primaryAddrMatches && primaryStreet?.attributes?.signType != null && nullif(primaryStreet?.attributes?.direction, '') == null;
+                                let missingDirection = primaryAddrMatches && primaryStreet?.signType != null && nullif(primaryStreet?.direction, '') == null;
 
                                 if (settings.IncludeAltNames && hasAltNames) {
-                                    for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length && !missingDirection; streetIx++) {
-                                        if (altAddrMatches[streetIx] && segment.getAttribute('streetIDs')[streetIx] != null) {
-                                            const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
-                                            missingDirection = street?.attributes?.signType != null && nullif(street?.attributes?.direction, '') == null;
+                                    for (let streetIx = 0; streetIx < segment.alternateStreetIds.length && !missingDirection; streetIx++) {
+                                        if (altAddrMatches[streetIx] && segment.alternateStreetIds[streetIx] != null) {
+                                            const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
+                                            missingDirection = street?.signType != null && nullif(street?.direction, '') == null;
                                         }
                                     }
                                 }
@@ -2304,13 +2378,13 @@ namespace WMEWAL_Streets {
                                     issues |= Issue.ShieldDirection;
                                 }
                             } else if (settings.ShieldDirectionOperation === HasOrMissing.Has) {
-                                let hasDirection = nullif(primaryStreet?.attributes?.direction, '') != null;
+                                let hasDirection = nullif(primaryStreet?.direction, '') != null;
 
                                 if (settings.IncludeAltNames && hasAltNames) {
-                                    for (let streetIx = 0; streetIx < segment.getAttribute('streetIDs').length && !hasDirection; streetIx++) {
-                                        if (altAddrMatches[streetIx] && altShieldMatches[streetIx] && segment.getAttribute('streetIDs')[streetIx] != null) {
-                                            const street = W.model.streets.getObjectById(segment.getAttribute('streetIDs')[streetIx]);
-                                            hasDirection = nullif(street?.attributes?.direction, '') != null;
+                                    for (let streetIx = 0; streetIx < segment.alternateStreetIds.length && !hasDirection; streetIx++) {
+                                        if (altAddrMatches[streetIx] && altShieldMatches[streetIx] && segment.alternateStreetIds[streetIx] != null) {
+                                            const street = sdk.DataModel.Streets.getById( { streetId: segment.alternateStreetIds[streetIx]});
+                                            hasDirection = nullif(street?.direction, '') != null;
                                         }
                                     }
                                 }
@@ -2327,34 +2401,35 @@ namespace WMEWAL_Streets {
                         }
 
                         if (!settings.Roundabouts) {
-                            addSegment(segment, (!segment.isInRoundabout() ? null : segment.getRoundabout().getAttribute('id')), issues, newSegment);
+                            addSegment(segment, segment.junctionId, issues, newSegment);
                         }
-                        else if (!segment.isInRoundabout() && settings.RoundaboutsOperation === 0) {
+                        else if (!segment.junctionId && settings.RoundaboutsOperation === 0) {
                             addSegment(segment, null, issues, newSegment);
                         }
-                        else if (segment.isInRoundabout() && settings.RoundaboutsOperation === 1) {
-                            let r = segment.getRoundabout().attributes;
-                            addSegment(segment, r.id, issues, newSegment);
+                        else if (segment.junctionId && settings.RoundaboutsOperation === 1) {
+                            //let r = segment.getRoundabout().attributes;
+                            addSegment(segment, segment.junctionId, issues, newSegment);
                         }
                     }
                 }
             }
         }
 
+        /* disable this for now
         if (settings.SuggestedSegmentsOperation != 2) {
             for (let ix = 0; ix < suggestedSegments.length; ix++) {
                 suggestedSegment = suggestedSegments[ix];
                 if (suggestedSegment != null) {
                     if ((WMEWAL.WazeRoadTypeToRoadTypeBitmask(suggestedSegment.getAttribute('roadType')) & settings.RoadTypeMask) &&
-                        (!settings.EditableByMe || suggestedSegment.arePropertiesEditable()) &&
+                        (!settings.EditableByMe || sdk.DataModel.Segments.hasPermissions({segmentId:suggestedSegment.getID()})) &&
                         (settings.Direction == null || determineDirection(suggestedSegment) === settings.Direction) &&
                         (!settings.Updated ||
                             (settings.UpdatedOperation === Operation.LessThan && suggestedSegment.getAttribute('updatedOn') < settings.UpdatedDate) ||
                             (settings.UpdatedOperation === Operation.LessThanOrEqual && suggestedSegment.getAttribute('updatedOn') <= settings.UpdatedDate) ||
                             (settings.UpdatedOperation === Operation.GreaterThan && suggestedSegment.getAttribute('updatedOn') > settings.UpdatedDate) ||
                             (settings.UpdatedOperation === Operation.GreaterThanOrEqual && suggestedSegment.getAttribute('updatedOn') >= settings.UpdatedDate)) &&
-                        ((settings.LastModifiedBy === null) ||
-                            ((suggestedSegment.getUpdatedBy() ?? suggestedSegment.getCreatedBy()) === settings.LastModifiedBy))) {
+                        ((settings.LastModifiedByName === null) ||
+                            ((suggestedSegment.getUpdatedBy() ?? suggestedSegment.getCreatedBy()) === settings.LastModifiedByName))) {
 
                         if (!WMEWAL.IsSegmentInArea(suggestedSegment)) {
                             continue;
@@ -2374,10 +2449,10 @@ namespace WMEWAL_Streets {
                     }
                 }
             }
-        }
+        } */
 
         for (let ix = 0; ix < extentStreets.length; ix++) {
-            extentStreets[ix].center = extentStreets[ix].geometries.getCentroid(true);
+            extentStreets[ix].center = turf.centroid(extentStreets[ix].geometries);
             delete extentStreets[ix].geometries;
             streets.push(extentStreets[ix]);
         }
@@ -2432,8 +2507,8 @@ namespace WMEWAL_Streets {
             const includeLength = settings.SegmentLength || settings.SegmentLengthFilter;
             const outputFields = WMEWAL.outputFields ?? ['CreatedEditor','LastEditor','LockLevel','Lat','Lon'];
             const includeLockLevel = outputFields.indexOf('LockLevel') > -1 || settings.LockLevel !== null;
-            const includeCreatedBy = outputFields.indexOf('CreatedEditor') > -1 || settings.CreatedBy !== null;
-            const includeLastUpdatedBy = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedBy !== null;
+            const includeCreatedBy = outputFields.indexOf('CreatedEditor') > -1 || !settings.CreatedByName;
+            const includeLastUpdatedBy = outputFields.indexOf('LastEditor') > -1 || !settings.LastModifiedByName;
             const includeLat = outputFields.indexOf('Lat') > -1;
             const includeLon = outputFields.indexOf('Lon') > -1;
             const includeRejectionReason = settings.SuggestedSegmentsOperation != 2 &&
@@ -2573,10 +2648,10 @@ namespace WMEWAL_Streets {
                 if (settings.EditableByMe) {
                     w.document.write("<div>Editable by me</div>");
                 }
-                if (settings.CreatedBy != null) {
+                if (settings.CreatedByName != null) {
                     w.document.write("<div>Created by " + createdByName + '</div>');
                 }
-                if (settings.LastModifiedBy != null) {
+                if (settings.LastModifiedByName != null) {
                     w.document.write("<div>Last updated by " + lastModifiedByName + '</div>');
                 }
                 if (settings.Unpaved) {
@@ -2842,9 +2917,9 @@ namespace WMEWAL_Streets {
                 if (settings.RampWithSL) {
                     w.document.write("<div>Ramp with speed limit</div>")
                 }
-                if (settings.NewlyPaved) {
-                    w.document.write("<div>Newly paved</div>");
-                }
+//                if (settings.NewlyPaved) {
+//                    w.document.write("<div>Newly paved</div>");
+//                }
                 if (settings.HasClosures) {
                     w.document.write("<div>Has closures</div>");
                 }
@@ -2952,7 +3027,7 @@ namespace WMEWAL_Streets {
                 if (street.name == null && street.roundaboutId == null) {
                     for (let ixSeg = 0; ixSeg < street.segments.length; ixSeg++) {
                         const segment = street.segments[ixSeg];
-                        const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(segment.center.x, segment.center.y);
+                        const latlon = {lon: segment.center.geometry.coordinates[0], lat: segment.center.geometry.coordinates[1]};
                         const plSeg = getSegmentPL(segment);
                         if (scanHasTTS && street.ttsOverrides.endsWith(' | ')) {
                             street.ttsOverrides = street.ttsOverrides.slice(0, street.ttsOverrides.length - 3);
@@ -3052,7 +3127,8 @@ namespace WMEWAL_Streets {
                         }
                     }
                 } else {
-                    const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(street.center.x, street.center.y);
+                    //const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(street.center.x, street.center.y);
+                    const latlon = {lon: street.center.geometry.coordinates[0], lat: street.center.geometry.coordinates[1]};
 
                     const plStreet = getStreetPL(street);
                     if (scanHasTTS && street.ttsOverrides.endsWith(' | ')) {
@@ -3230,7 +3306,8 @@ namespace WMEWAL_Streets {
     }
 
     function getStreetPL(street: IStreet): string {
-        const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(street.center.x, street.center.y);
+        //const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(street.center.x, street.center.y);
+        const latlon = {lon: street.center.geometry.coordinates[0], lat: street.center.geometry.coordinates[1]};
         let url = WMEWAL.GenerateBasePL(latlon.lat, latlon.lon,  WMEWAL.zoomLevel) + '&' + (street.type == 'suggestedsegment' ? 'segmentSuggestions' : 'segments') + '=';
         for (let ix = 0; ix < street.segments.length; ix++) {
             if (ix > 0) {
@@ -3242,7 +3319,8 @@ namespace WMEWAL_Streets {
     }
 
     function getSegmentPL(segment: ISegment): string {
-        const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(segment.center.x, segment.center.y);
+        //const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(segment.center.x, segment.center.y);
+        const latlon = {lon: segment.center.geometry.coordinates[0], lat: segment.center.geometry.coordinates[1]};
         return WMEWAL.GenerateBasePL(latlon.lat, latlon.lon, 5) + "&" + (segment.type == 'suggestedsegment' ? 'segmentSuggestions' : 'segments') + '=' + segment.id;
     }
 
@@ -3303,9 +3381,9 @@ namespace WMEWAL_Streets {
         if (issues & Issue.RampWithSL) {
             issuesList.push("Ramp with speed limit")
         }
-        if (issues & Issue.NewlyPaved) {
-            issuesList.push("Newly paved");
-        }
+//        if (issues & Issue.NewlyPaved) {
+//            issuesList.push("Newly paved");
+//        }
         if (issues & Issue.OneWay) {
             issuesList.push("One way");
         }
@@ -3384,7 +3462,7 @@ namespace WMEWAL_Streets {
             SegmentLengthOperation: Operation.LessThan,
             SegmentLengthValue: null,
             SegmentLengthUnit: isImperial ? Unit.Imperial : Unit.Metric,
-            LastModifiedBy: null,
+            LastModifiedByName: "",
             HasNoName: false,
             HasNoCity: false,
             HasNoCityOperation: PrimaryOrAlt.Either,
@@ -3398,7 +3476,7 @@ namespace WMEWAL_Streets {
             NearHOV: false,
             Toll: false,
             Beacons: false,
-            CreatedBy: null,
+            CreatedByName: "",
             LaneGuidance: false,
             LaneGuidanceOperation: 0,
             Created: false,
@@ -3409,7 +3487,7 @@ namespace WMEWAL_Streets {
             UpdatedDate: null,
             Minus1RoutingPreference: false,
             Plus1RoutingPreference: false,
-            NewlyPaved: false,
+            //NewlyPaved: false,
             SegmentLengthFilter: false,
             SegmentLengthFilterOperation: Operation.LessThan,
             SegmentLengthFilterValue: null,
@@ -3465,8 +3543,8 @@ namespace WMEWAL_Streets {
                 upd = true;
             }
 
-            if (!settings.hasOwnProperty("LastModifiedBy")) {
-                settings.LastModifiedBy = null;
+            if (!settings.hasOwnProperty("LastModifiedByName")) {
+                settings.LastModifiedByName = "";
                 upd = true;
             }
 
@@ -3555,8 +3633,8 @@ namespace WMEWAL_Streets {
                 upd = true;
             }
 
-            if (!settings.hasOwnProperty("CreatedBy")) {
-                settings.CreatedBy = null;
+            if (!settings.hasOwnProperty("CreatedByName")) {
+                settings.CreatedByName = null;
                 upd = true;
             }
 
@@ -3600,10 +3678,10 @@ namespace WMEWAL_Streets {
                 upd = true;
             }
 
-            if (!settings.hasOwnProperty("NewlyPaved")) {
+        /*    if (!settings.hasOwnProperty("NewlyPaved")) {
                 settings.NewlyPaved = false;
                 upd = true;
-            }
+            } */
 
             if (!settings.hasOwnProperty("SegmentLengthUnit") || settings.SegmentLengthUnit == null) {
                 if (settings.SegmentLength != null) {
@@ -3906,5 +3984,4 @@ namespace WMEWAL_Streets {
         }
     }
 
-    bootstrap();
 }

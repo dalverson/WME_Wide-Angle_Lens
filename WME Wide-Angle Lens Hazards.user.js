@@ -1,12 +1,7 @@
-/// <reference path="../typescript-typings/globals/openlayers/index.d.ts" />
-/// <reference path="../typescript-typings/I18n.d.ts" />
-/// <reference path="../typescript-typings/waze.d.ts" />
-/// <reference path="../typescript-typings/globals/jquery/index.d.ts" />
 /// <reference path="WME Wide-Angle Lens.user.ts" />
-/// <reference path="../typescript-typings/greasyfork.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens Hazards
-// @version             2026.04.22.001
+// @version             2026.08.26.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Find permanent hazards
 // @author              DaveaCincy  (based on Places plugin by vtpearce and crazycaveman)
@@ -19,23 +14,24 @@
 // @copyright           2020 vtpearce
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
 // @downloadURL         https://greasyfork.org/en/scripts/532474-wme-wide-angle-lens-hazards/code/WME%20Wide-Angle%20Lens%20Hazards.user.js
 // @updateURL           https://greasyfork.org/en/scripts/532474-wme-wide-angle-lens-hazards/code/WME%20Wide-Angle%20Lens%20Hazards.meta.js
 // @connect             greasyfork.org
 // ==/UserScript==
-/*global W, I18n, $, WazeWrap, WMEWAL, OpenLayers */
+/* global turf, W, I18n, $, WazeWrap, WMEWAL */
 var WMEWAL_Hazards;
 (function (WMEWAL_Hazards) {
     const SCRIPT_NAME = GM_info.script.name;
     const SCRIPT_VERSION = GM_info.script.version.toString();
     const DOWNLOAD_URL = GM_info.script.downloadURL;
     const updateText = '<ul>'
-        + '<li>Add Traffic Light hazards.</li>'
+        + '<li>SDK migration.</li>'
         + '</ul>';
     const greasyForkPage = 'https://greasyfork.org/scripts/40645';
     const wazeForumThread = 'https://www.waze.com/discuss/t/script-wme-wide-angle-lens/77807';
     const ctlPrefix = "_wmewalHazards";
-    const minimumWALVersionRequired = "2025.04.10.001";
+    const minimumWALVersionRequired = "2026.06.06.001";
     let Operation;
     (function (Operation) {
         Operation[Operation["Equal"] = 1] = "Equal";
@@ -75,9 +71,9 @@ var WMEWAL_Hazards;
     WMEWAL_Hazards.SupportsVenues = false;
     const settingsKey = "WMEWALHazardsSettings";
     const savedSettingsKey = "WMEWALHazardsSavedSettings";
+    let sdk;
     let settings = null;
     let savedSettings = [];
-    //let places: Array<IPlace>;
     let hazards;
     let nameRegex = null;
     let cityRegex = null;
@@ -97,10 +93,16 @@ var WMEWAL_Hazards;
     let haveScheds = false;
     let haveStreets = false;
     let savedHazards;
+    const sandboxed = typeof unsafeWindow !== 'undefined';
+    const pageWindow = sandboxed ? unsafeWindow : window;
+    pageWindow.SDK_INITIALIZED.then(() => {
+        onWmeReady();
+    });
     function onWmeReady() {
         initCount++;
         if (WazeWrap && WazeWrap.Ready && typeof (WMEWAL) !== 'undefined' && WMEWAL && WMEWAL.RegisterPlugIn) {
             log('debug', 'WazeWrap and WMEWAL ready.');
+            sdk = WMEWAL.sdk;
             init();
         }
         else {
@@ -111,14 +113,6 @@ var WMEWAL_Hazards;
             else {
                 log('error', 'WazeWrap or WMEWAL not ready. Giving up.');
             }
-        }
-    }
-    function bootstrap() {
-        if (W?.userscripts?.state.isReady) {
-            onWmeReady();
-        }
-        else {
-            document.addEventListener('wme-ready', onWmeReady, { once: true });
         }
     }
     async function init() {
@@ -728,7 +722,7 @@ var WMEWAL_Hazards;
             const phazard = W.model.permanentHazards.getObjectById(Number(h));
             if (phazard != null) {
                 if ((WazeHazardTypeToHazardTypeBitmask(phazard.getAttribute('type')) & settings.HazardTypeMask) &&
-                    //(!settings.EditableByMe || phazard.arePropertiesEditable() || phazard.areUpdateRequestsEditable()) &&
+                    (!settings.EditableByMe || phazard.arePropertiesEditable() /*|| phazard.areUpdateRequestsEditable()*/) &&
                     (nameRegex == null || nameRegex.test(phazard.getAttribute('name'))) &&
                     (!settings.Created ||
                         (settings.CreatedOperation === Operation.LessThan && phazard.getAttribute('createdOn') < settings.CreatedDate) ||
@@ -746,8 +740,6 @@ var WMEWAL_Hazards;
                         ((phazard.getUpdatedBy() ?? phazard.getCreatedBy()) === settings.LastModifiedBy))) {
                     let issues = 0;
                     /*
-                    
-                    
                                         if (settings.NoName && !venue.getAttribute('name')) {
                                             issues |= Issue.NoName;
                                         }
@@ -756,7 +748,6 @@ var WMEWAL_Hazards;
                                             // If at least one issue was chosen and this segment doesn't have any issues, then skip it
                                             continue;
                                         }
-                    
                     */
                     // Don't add it if we've already done so
                     if (savedHazards.indexOf(phazard.getID()) === -1) {
@@ -795,16 +786,17 @@ var WMEWAL_Hazards;
                         var streetName = '';
                         var cityName = '';
                         if (segmentId) {
-                            const s = W.model.segments.getObjectById(segmentId);
-                            const address = s.getAddress(W.model);
-                            streetName = (address && !address.isEmpty() && !address.isEmptyStreet()) ? address.attributes.street.getAttribute('name') : "";
-                            cityName = (address && !address.isEmpty()) ? address.getCityName() : "";
-                            if (address.getCity().isEmpty()) {
-                                const alt = address.attributes.altStreets;
+                            //const s = W.model.segments.getObjectById(segmentId);
+                            //const address = s.getAddress(W.model);
+                            const address = sdk.DataModel.Segments.getAddress({ segmentId });
+                            streetName = (address && !address.isEmpty && !address.street.isEmpty) ? address.street.name : "";
+                            cityName = (address && !address.isEmpty) ? address.city.name : "";
+                            if (address.city.isEmpty) {
+                                const alt = address.altStreets;
                                 for (var i = 0; i < alt.length; i++) {
                                     const a = alt[i];
-                                    if (!a.getCity().isEmpty()) {
-                                        cityName = a.getCityName();
+                                    if (!a.city.isEmpty) {
+                                        cityName = a.city.name;
                                         break;
                                     }
                                 }
@@ -824,7 +816,7 @@ var WMEWAL_Hazards;
                             streetName,
                             cityName,
                             name: phazard.getAttribute('name'),
-                            pointGeometry: phazard.getOLGeometry().getCentroid(),
+                            pointGeometry: turf.centroid(phazard.getGeometry()),
                             segmentId,
                             lastEditor: lastEditor?.getAttribute('userName') ?? '',
                             createdBy: createdBy?.getAttribute('userName') ?? '',
@@ -1036,7 +1028,7 @@ var WMEWAL_Hazards;
             for (let ixHazard = 0; ixHazard < hazards.length; ixHazard++) {
                 const ahazard = hazards[ixHazard];
                 const plPlace = getHazardPL(ahazard);
-                const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(ahazard.pointGeometry.x, ahazard.pointGeometry.y);
+                const latlon = { lon: ahazard.pointGeometry.geometry.coordinates[0], lat: ahazard.pointGeometry.geometry.coordinates[1] };
                 const tName = (ahazard.name == null) ? "" : ahazard.name;
                 const tSpeed = (ahazard.speedLimit > 0) ? ahazard.speedLimit.toString() : "";
                 if (isCSV) {
@@ -1075,7 +1067,7 @@ var WMEWAL_Hazards;
                     columnArray.push(`"${plPlace}"`);
                     lineArray.push(columnArray);
                 }
-                if (isTab) {
+                if (isTab && w && w.document) {
                     w.document.write(`<tr><td>${ahazard.phType}</td>`);
                     if (haveNames) {
                         w.document.write(`<td>${tName}</td>`);
@@ -1127,7 +1119,7 @@ var WMEWAL_Hazards;
                 link.click();
                 document.body.removeChild(node);
             }
-            if (isTab) {
+            if (isTab && w && w.document) {
                 WMEWAL.writeErrText(w);
                 w.document.write("</tbody></table></body></html>");
                 w.document.close();
@@ -1236,7 +1228,7 @@ var WMEWAL_Hazards;
     }
     //https://waze.com/en-US/editor?env=usa&lat=41.12872&lon=-81.87867&zoomLevel=18&permanentHazards=140620
     function getHazardPL(haz) {
-        const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(haz.pointGeometry.x, haz.pointGeometry.y);
+        const latlon = { lon: haz.pointGeometry.geometry.coordinates[0], lat: haz.pointGeometry.geometry.coordinates[1] };
         return WMEWAL.GenerateBasePL(latlon.lat, latlon.lon, 18) + "&permanentHazards=" + haz.id;
     }
     function getIssues(issues) {
@@ -1308,5 +1300,4 @@ var WMEWAL_Hazards;
             log('error', ex);
         }
     }
-    bootstrap();
 })(WMEWAL_Hazards || (WMEWAL_Hazards = {}));

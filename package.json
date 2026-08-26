@@ -1,0 +1,12 @@
+{
+	"name": "wme-wide-angle-lens",
+	"devDependencies": {
+		"@turf/turf": "^7",
+		"wme-sdk-typings": "https://web-assets.waze.com/wme_sdk_docs/beta/latest/wme-sdk-typings.tgz"
+	},
+	"version": "1.0.0",
+	"description": "",
+	"main": "WME Wide-Angle Lens.ts",
+	"type": "commonjs"
+
+}
