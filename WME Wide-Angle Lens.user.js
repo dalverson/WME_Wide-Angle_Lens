@@ -7,7 +7,7 @@
 /// <reference path="../typescript-typings/greasyfork.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens
-// @version             2026.08.26.001
+// @version             2026.08.28.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Scan a large area
 // @author              vtpearce and crazycaveman (progress bar from dummyd2 & seb-d59)
@@ -21,15 +21,12 @@
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
 // @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
-// @updateURL           https://greasyfork.org/scripts/40641-wme-wide-angle-lens/code/WME%20Wide-Angle%20Lens.meta.js
-// @downloadURL         https://greasyfork.org/scripts/40641-wme-wide-angle-lens/code/WME%20Wide-Angle%20Lens.user.js
 // @connect             greasyfork.org
 // ==/UserScript==
-// @updateURL           https://greasyfork.org/scripts/418291-wme-wide-angle-lens-beta/code/WME%20Wide-Angle%20Lens.meta.js
-// @downloadURL         https://greasyfork.org/scripts/418291-wme-wide-angle-lens-beta/code/WME%20Wide-Angle%20Lens.user.js
 var WMEWAL;
 (function (WMEWAL) {
     const SCRIPT_NAME = GM_info.script.name;
+    const SHORT_SCRIPT_NAME = "WAL";
     const SCRIPT_VERSION = GM_info.script.version.toString();
     const scriptName = GM_info.script.name;
     const scriptId = 'wmewal';
@@ -296,8 +293,18 @@ var WMEWAL;
                 };
             }
             if (localStorage[savedAreasKey]) {
+                let areas = [];
                 let areasString = localStorage[savedAreasKey];
-                let areas = JSON.parse(areasString);
+                if (areasString.substring(0, 1) === "~") {
+                    // Compressed value - decompress
+                    areasString = WMEWAL.LZString.decompressFromUTF16(areasString.substring(1));
+                }
+                try {
+                    areas = JSON.parse(areasString);
+                }
+                catch (e) {
+                    log("warn", 'error in areas store ', e);
+                }
                 for (let ix = 0; ix < areas.length; ix++) {
                     // check if loaded from settings (old format) and remove
                     for (let j = settings.SavedAreas.length - 1; j >= 0; j--) {
@@ -315,6 +322,12 @@ var WMEWAL;
                 let badAreas = [];
                 for (let ix = 0; ix < settings.SavedAreas.length; ix++) {
                     if (settings.SavedAreas[ix].geometryText) {
+                        if (settings.SavedAreas[ix].geometryText.includes('NaN')) {
+                            log('error', 'bad data in area ' + settings.SavedAreas[ix].name, settings.SavedAreas[ix].geometryText);
+                            badAreas.push(settings.SavedAreas[ix].name);
+                            delete settings.SavedAreas[ix].geometryText;
+                            continue;
+                        }
                         settings.SavedAreas[ix].geometry = OpenLayers.Geometry.fromWKT(settings.SavedAreas[ix].geometryText);
                         while ((settings.SavedAreas[ix].geometry.CLASS_NAME === "OL.Geometry.Collection" ||
                             settings.SavedAreas[ix].geometry.CLASS_NAME === "OpenLayers.Geometry.Collection") &&
@@ -346,7 +359,7 @@ var WMEWAL;
                     }
                 }
                 if (badAreas.length) {
-                    WazeWrap.Alerts.warning(SCRIPT_NAME, "Could not convert these areas. Look in developer console for messages that might help debug this. " + badAreas.join(', '));
+                    WazeWrap.Alerts.info(SCRIPT_NAME, "Could not convert these areas. Look in developer console for messages that might help debug this. " + badAreas.join(', '), true);
                 }
                 saveAreas();
             }
@@ -759,7 +772,28 @@ var WMEWAL;
                     });
                 }
             }
-            localStorage[savedAreasKey] = JSON.stringify(newSavedAreas, function (key, val) { return val.toFixed ? Number(val.toFixed(5)) : val; });
+            const astore = JSON.stringify(newSavedAreas, function (key, val) { return val.toFixed ? Number(val.toFixed(5)) : val; });
+            log("Debug", "Areas settings len: " + astore.length);
+            let err = false;
+            try {
+                localStorage[savedAreasKey] = astore;
+            }
+            catch (e) {
+                log("debug", "Error saving areas, len=" + astore.length, e);
+                err = true;
+            }
+            if (err) {
+                const astoreLZ = "~" + WMEWAL.LZString.compressToUTF16(astore);
+                log("Debug", "Areas settings compressed len: " + astoreLZ.length);
+                try {
+                    localStorage[savedAreasKey] = astoreLZ;
+                }
+                catch (e) {
+                    WazeWrap.Alerts.warning(SCRIPT_NAME, "Error saving areas.");
+                    log("error", "Error saving areas compressed, len=" + astoreLZ.length, e);
+                    err = true;
+                }
+            }
         }
     }
     function importFile() {
@@ -1535,21 +1569,21 @@ var WMEWAL;
         switch (level.toLocaleLowerCase()) {
             case "debug":
             case "verbose":
-                console.debug(`${SCRIPT_NAME}:`, ...args);
+                console.debug(`${SHORT_SCRIPT_NAME}:`, ...args);
                 break;
             case "info":
             case "information":
-                console.info(`${SCRIPT_NAME}:`, ...args);
+                console.info(`${SHORT_SCRIPT_NAME}:`, ...args);
                 break;
             case "warning":
             case "warn":
-                console.warn(`${SCRIPT_NAME}:`, ...args);
+                console.warn(`${SHORT_SCRIPT_NAME}:`, ...args);
                 break;
             case "error":
-                console.error(`${SCRIPT_NAME}:`, ...args);
+                console.error(`${SHORT_SCRIPT_NAME}:`, ...args);
                 break;
             case "log":
-                console.log(`${SCRIPT_NAME}:`, ...args);
+                console.log(`${SHORT_SCRIPT_NAME}:`, ...args);
                 break;
             default:
                 break;
