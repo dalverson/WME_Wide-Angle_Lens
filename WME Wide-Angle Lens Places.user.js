@@ -1,12 +1,7 @@
-/// <reference path="../typescript-typings/globals/openlayers/index.d.ts" />
-/// <reference path="../typescript-typings/I18n.d.ts" />
-/// <reference path="../typescript-typings/waze.d.ts" />
-/// <reference path="../typescript-typings/globals/jquery/index.d.ts" />
 /// <reference path="WME Wide-Angle Lens.user.ts" />
-/// <reference path="../typescript-typings/greasyfork.d.ts" />
 // ==UserScript==
 // @name                WME Wide-Angle Lens Places
-// @version             2026.04.22.001
+// @version             2026.08.26.001
 // @namespace           https://greasyfork.org/en/users/19861-vtpearce
 // @description         Find place that match filter criteria
 // @author              vtpearce and crazycaveman
@@ -19,25 +14,23 @@
 // @copyright           2020 vtpearce
 // @license             CC BY-SA 4.0
 // @require             https://greasyfork.org/scripts/24851-wazewrap/code/WazeWrap.js
+// @require             https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
 // @updateURL           https://greasyfork.org/scripts/40645-wme-wide-angle-lens-places/code/WME%20Wide-Angle%20Lens%20Places.meta.js
 // @downloadURL         https://greasyfork.org/scripts/40645-wme-wide-angle-lens-places/code/WME%20Wide-Angle%20Lens%20Places.user.js
 // @connect             greasyfork.org
 // ==/UserScript==
-// @updateURL           https://greasyfork.org/scripts/418293-wme-wide-angle-lens-places-beta/code/WME%20Wide-Angle%20Lens%20Places.meta.js
-// @downloadURL         https://greasyfork.org/scripts/418293-wme-wide-angle-lens-places-beta/code/WME%20Wide-Angle%20Lens%20Places.user.js
-/*global W, OL, I18n, $, WazeWrap, WMEWAL, OpenLayers */
 var WMEWAL_Places;
 (function (WMEWAL_Places) {
     const SCRIPT_NAME = GM_info.script.name;
     const SCRIPT_VERSION = GM_info.script.version.toString();
     const DOWNLOAD_URL = GM_info.script.downloadURL;
     const updateText = '<ul>'
-        + '<li>Compatibilty release.</li>'
+        + '<li>SDK migration.</li>'
         + '</ul>';
     const greasyForkPage = 'https://greasyfork.org/scripts/40645';
     const wazeForumThread = 'https://www.waze.com/discuss/t/script-wme-wide-angle-lens/77807';
     const ctlPrefix = "_wmewalPlaces";
-    const minimumWALVersionRequired = "2025.04.10.001";
+    const minimumWALVersionRequired = "2026.06.06.001";
     let Operation;
     (function (Operation) {
         Operation[Operation["Equal"] = 1] = "Equal";
@@ -70,6 +63,7 @@ var WMEWAL_Places;
     WMEWAL_Places.MinimumZoomLevel = 17;
     WMEWAL_Places.SupportsSegments = false;
     WMEWAL_Places.SupportsVenues = true;
+    let sdk;
     const settingsKey = "WMEWALPlacesSettings";
     const savedSettingsKey = "WMEWALPlacesSavedSettings";
     let settings = null;
@@ -81,17 +75,21 @@ var WMEWAL_Places;
     let streetRegex = null;
     let state;
     let stateName;
-    let lastModifiedBy;
     let lastModifiedByName;
-    let createdBy;
     let createdByName;
     let initCount = 0;
     let detectIssues = false;
     let savedVenues;
+    const sandboxed = typeof unsafeWindow !== 'undefined';
+    const pageWindow = sandboxed ? unsafeWindow : window;
+    pageWindow.SDK_INITIALIZED.then(() => {
+        onWmeReady();
+    });
     function onWmeReady() {
         initCount++;
         if (WazeWrap && WazeWrap.Ready && typeof (WMEWAL) !== 'undefined' && WMEWAL && WMEWAL.RegisterPlugIn) {
             log('debug', 'WazeWrap and WMEWAL ready.');
+            sdk = WMEWAL.sdk;
             init();
         }
         else {
@@ -102,14 +100,6 @@ var WMEWAL_Places;
             else {
                 log('error', 'WazeWrap or WMEWAL not ready. Giving up.');
             }
-        }
-    }
-    function bootstrap() {
-        if (W?.userscripts?.state.isReady) {
-            onWmeReady();
-        }
-        else {
-            document.addEventListener('wme-ready', onWmeReady, { once: true });
         }
     }
     async function init() {
@@ -178,13 +168,18 @@ var WMEWAL_Places;
             "</select>";
         html += `<select id='${ctlPrefix}Category'>` +
             "<option value=''></option>";
-        for (let topIx = 0; topIx < W.Config.venues.categories.length; topIx++) {
-            const topCategory = W.Config.venues.categories[topIx];
-            html += ("<option value='" + topCategory + "'>" + I18n.t("venues.categories." + topCategory) + "</option>");
-            const subCategories = W.Config.venues.subcategories[topCategory];
-            for (let subIx = 0; subIx < subCategories.length; subIx++) {
-                const subCategory = W.Config.venues.subcategories[topCategory][subIx];
-                html += ("<option value='" + subCategory + "'>--" + I18n.t("venues.categories." + subCategory) + "</option>");
+        const topCats = sdk.DataModel.Venues.getVenueMainCategories();
+        const subCats = sdk.DataModel.Venues.getVenueSubCategories();
+        for (let topIx = 0; topIx < topCats.length; topIx++) {
+            const topCategory = topCats[topIx].localizedName;
+            const topId = topCats[topIx].id;
+            html += ("<option value='" + topCategory + "'>" + topCategory + "</option>");
+            //const subCategories = W.Config.venues.subcategories[topCategory];
+            for (let subIx = 0; subIx < subCats.length; subIx++) {
+                const subCategory = subCats[subIx];
+                if (subCategory.categoryId == topId) {
+                    html += ("<option value='" + subCategory.localizedName + "'>--" + subCategory.localizedName + "</option>");
+                }
             }
         }
         html += "<option value='" + rpp + "'>" + I18n.t("venues.categories." + rpp) + "</option>";
@@ -236,7 +231,7 @@ var WMEWAL_Places;
             "</select></td></tr>";
         html += "<tr><td><b>Created By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}CreatedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}CreatedByName'></select></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}Created' class='wal-check' type='checkbox' />` +
             `<label for=${ctlPrefix}Created' class='wal-label'>Date Created:</label> ` +
             `<select id='${ctlPrefix}CreatedOp'>` +
@@ -249,7 +244,7 @@ var WMEWAL_Places;
             `<input id='${ctlPrefix}CreatedDate' type='date'/> <input id='${ctlPrefix}CreatedTime' type='time'/></td></tr>`;
         html += "<tr><td><b>Last Updated By:</b></td></tr>";
         html += "<tr><td class='wal-indent'>" +
-            `<select id='${ctlPrefix}LastModifiedBy'></select></td></tr>`;
+            `<select id='${ctlPrefix}LastModifiedByName'></select></td></tr>`;
         html += `<tr><td><input id='${ctlPrefix}Updated' class='wal-check' type='checkbox' />` +
             `<label for=${ctlPrefix}Updated' class='wal-label'>Date Updated:</label> ` +
             `<select id='${ctlPrefix}UpdatedOp'>` +
@@ -307,16 +302,16 @@ var WMEWAL_Places;
     function TabLoaded() {
         loadScriptUpdateMonitor();
         updateStates();
-        updateUsers($(`#${ctlPrefix}LastModifiedBy`));
-        updateUsers($(`#${ctlPrefix}CreatedBy`));
+        updateUsers($(`#${ctlPrefix}LastModifiedByName`));
+        updateUsers($(`#${ctlPrefix}CreatedByName`));
         updateUI();
         updateSavedSettingsList();
         $(`#${ctlPrefix}State`).on("focus", updateStates);
-        $(`#${ctlPrefix}LastModifiedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}LastModifiedBy`));
+        $(`#${ctlPrefix}LastModifiedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}LastModifiedByName`));
         });
-        $(`#${ctlPrefix}CreatedBy`).on("focus", function () {
-            updateUsers($(`#${ctlPrefix}CreatedBy`));
+        $(`#${ctlPrefix}CreatedByName`).on("focus", function () {
+            updateUsers($(`#${ctlPrefix}CreatedByName`));
         });
         $(`#${ctlPrefix}LoadSetting`).on("click", loadSetting);
         $(`#${ctlPrefix}SaveSetting`).on("click", saveSetting);
@@ -335,13 +330,10 @@ var WMEWAL_Places;
         selectState.empty();
         const stateObjs = [];
         stateObjs.push({ id: null, name: "" });
-        for (let s in W.model.states.objects) {
-            if (W.model.states.objects.hasOwnProperty(s)) {
-                const st = W.model.states.getObjectById(parseInt(s));
-                if (st.getAttribute('id') !== 1 && st.getAttribute('name').length !== 0) {
-                    stateObjs.push({ id: st.getAttribute('id'), name: st.getAttribute('name') });
-                }
-            }
+        const sl = sdk.DataModel.States.getAll();
+        for (let i = 0; i < sl.length; i++) {
+            const s = sl[i];
+            stateObjs.push({ id: s.id, name: s.name });
         }
         stateObjs.sort(function (a, b) {
             if (a.id == null) {
@@ -362,7 +354,7 @@ var WMEWAL_Places;
     }
     function updateUsers(selectUsernameList) {
         // Preserve current selection
-        const currentId = parseInt(selectUsernameList.val());
+        const currentUser = selectUsernameList.val();
         selectUsernameList.empty();
         const userObjs = [];
         userObjs.push({ id: null, name: "" });
@@ -384,8 +376,8 @@ var WMEWAL_Places;
         });
         for (let ix = 0; ix < userObjs.length; ix++) {
             const o = userObjs[ix];
-            const userOption = $("<option/>").text(o.name).attr("value", o.id);
-            if (currentId != null && o.id == null) {
+            const userOption = $("<option/>").text(o.name).attr("value", o.name);
+            if (currentUser != null && o.name == currentUser) {
                 userOption.attr("selected", "selected");
             }
             selectUsernameList.append(userOption);
@@ -421,8 +413,8 @@ var WMEWAL_Places;
         $(`#${ctlPrefix}PendingApproval`).prop("checked", settings.PendingApproval);
         $(`#${ctlPrefix}NoStreet`).prop("checked", settings.NoStreet);
         $(`#${ctlPrefix}NoCity`).prop("checked", settings.NoCity);
-        $(`#${ctlPrefix}LastModifiedBy`).val(settings.LastModifiedBy);
-        $(`#${ctlPrefix}CreatedBy`).val(settings.CreatedBy);
+        $(`#${ctlPrefix}LastModifiedByName`).val(settings.LastModifiedByName);
+        $(`#${ctlPrefix}CreatedByName`).val(settings.CreatedByName);
         $(`#${ctlPrefix}NoExternalProviders`).prop("checked", settings.NoExternalProviders);
         $(`#${ctlPrefix}NoHours`).prop("checked", settings.NoHours);
         $(`#${ctlPrefix}NoPhoneNumber`).prop("checked", settings.NoPhoneNumber);
@@ -522,12 +514,12 @@ var WMEWAL_Places;
         if (nullif(selectedState, "") !== null && s.State === null) {
             addMessage("Invalid state selection");
         }
-        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedBy`).val();
-        if (nullif(selectedModifiedUser, "") !== null && s.LastModifiedBy === null) {
+        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedByName`).val();
+        if (nullif(selectedModifiedUser, "") !== null && s.LastModifiedByName == "") {
             addMessage("Invalid last modified user");
         }
-        const selectedCreatedUser = $(`#${ctlPrefix}CreatedBy`).val();
-        if (nullif(selectedCreatedUser, "") !== null && s.CreatedBy === null) {
+        const selectedCreatedUser = $(`#${ctlPrefix}CreatedByName`).val();
+        if (nullif(selectedCreatedUser, "") !== null && s.CreatedByName == "") {
             addMessage("Invalid created user");
         }
         if (s.ParkingLotType) {
@@ -603,8 +595,8 @@ var WMEWAL_Places;
             CityRegexIgnoreCase: $(`#${ctlPrefix}CityIgnoreCase`).prop("checked"),
             NoStreet: $(`#${ctlPrefix}NoStreet`).prop("checked"),
             NoCity: $(`#${ctlPrefix}NoCity`).prop("checked"),
-            LastModifiedBy: null,
-            CreatedBy: null,
+            LastModifiedByName: "",
+            CreatedByName: "",
             NoExternalProviders: $(`#${ctlPrefix}NoExternalProviders`).prop("checked"),
             NoHours: $(`#${ctlPrefix}NoHours`).prop("checked"),
             NoPhoneNumber: $(`#${ctlPrefix}NoPhoneNumber`).prop("checked"),
@@ -637,19 +629,13 @@ var WMEWAL_Places;
                 s.State = state.getAttribute('id');
             }
         }
-        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedBy`).val();
+        const selectedModifiedUser = $(`#${ctlPrefix}LastModifiedByName`).val();
         if (nullif(selectedModifiedUser, "") !== null) {
-            const u = W.model.users.getObjectById(selectedModifiedUser);
-            if (u !== null) {
-                s.LastModifiedBy = u.getAttribute('id');
-            }
+            s.LastModifiedByName = selectedModifiedUser;
         }
-        const selectedCreatedUser = $(`#${ctlPrefix}CreatedBy`).val();
+        const selectedCreatedUser = $(`#${ctlPrefix}CreatedByName`).val();
         if (nullif(selectedCreatedUser, "") !== null) {
-            const u = W.model.users.getObjectById(selectedCreatedUser);
-            if (u !== null) {
-                s.CreatedBy = u.getAttribute('id');
-            }
+            s.CreatedByName = selectedCreatedUser;
         }
         const selectedLockLevel = $(`#${ctlPrefix}LockLevel`).val();
         if (selectedLockLevel != null && selectedLockLevel.length > 0) {
@@ -722,28 +708,24 @@ var WMEWAL_Places;
                 streetRegex = null;
             }
             if (settings.State !== null) {
-                state = W.model.states.getObjectById(settings.State);
-                stateName = state.getAttribute('name');
+                state = sdk.DataModel.States.getById({ stateId: settings.State });
+                stateName = state.name;
             }
             else {
                 state = null;
                 stateName = null;
             }
-            if (settings.LastModifiedBy !== null) {
-                lastModifiedBy = W.model.users.getObjectById(settings.LastModifiedBy);
-                lastModifiedByName = lastModifiedBy.getAttribute('userName');
+            if (settings.LastModifiedByName !== null) {
+                lastModifiedByName = settings.LastModifiedByName;
             }
             else {
-                lastModifiedBy = null;
-                lastModifiedByName = null;
+                lastModifiedByName = "";
             }
-            if (settings.CreatedBy !== null) {
-                createdBy = W.model.users.getObjectById(settings.CreatedBy);
-                createdByName = createdBy.getAttribute('userName');
+            if (settings.CreatedByName !== null) {
+                createdByName = settings.CreatedByName;
             }
             else {
-                createdBy = null;
-                createdByName = null;
+                createdByName = "";
             }
             detectIssues = settings.NoName ||
                 settings.NoHouseNumber ||
@@ -788,39 +770,42 @@ var WMEWAL_Places;
         for (let ix = 0; ix < venues.length; ix++) {
             const venue = venues[ix];
             if (venue != null) {
-                const categories = venue.getAttribute('categories');
-                const address = venue.getAddress(W.model);
-                if (venue.getAttribute('streetID') && address && address.getCountry() == null) {
-                    log("warn", "no address for streetID " + venue.getAttribute('streetID') + ", venue " + venue.getAttribute('name') + " " + venue.getID());
+                const categories = venue.categories;
+                const isPLA = venue.categories[0] == 'PARKING_LOT';
+                const plType = sdk.DataModel.Venues.getParkingLotType({ venueId: venue.id });
+                const address = sdk.DataModel.Venues.getAddress({ venueId: venue.id });
+                const isEditable = sdk.DataModel.Venues.hasPermissions({ venueId: venue.id });
+                if (address && address.country == null) {
+                    log("warn", "no country on venue address , venue " + venue.name + " " + venue.id);
                 }
-                const houseNum = venue.getAttribute('houseNumber') ?? "";
+                const houseNum = address.houseNumber ?? "";
                 if ((settings.LockLevel == null ||
-                    (settings.LockLevelOperation === Operation.Equal && (venue.getAttribute('lockRank') || 0) + 1 === settings.LockLevel) ||
-                    (settings.LockLevelOperation === Operation.NotEqual && (venue.getAttribute('lockRank') || 0) + 1 !== settings.LockLevel)) &&
-                    (!settings.EditableByMe || venue.arePropertiesEditable() || venue.areUpdateRequestsEditable()) &&
-                    (settings.PlaceType == null || (settings.PlaceType === "point" && venue.isPoint() && !venue.is2D()) || (settings.PlaceType === "area" && !venue.isPoint() && venue.is2D())) &&
-                    (nameRegex == null || nameRegex.test(venue.getAttribute('name'))) &&
+                    (settings.LockLevelOperation === Operation.Equal && (venue.lockRank || 0) + 1 === settings.LockLevel) ||
+                    (settings.LockLevelOperation === Operation.NotEqual && (venue.lockRank || 0) + 1 !== settings.LockLevel)) &&
+                    (!settings.EditableByMe || isEditable) &&
+                    (settings.PlaceType == null || (settings.PlaceType === "point" && venue.geometry.type == 'Point') || (settings.PlaceType === "area" && venue.geometry.type == 'Polygon')) &&
+                    (nameRegex == null || nameRegex.test(venue.name)) &&
                     (!settings.Created ||
-                        (settings.CreatedOperation === Operation.LessThan && venue.getAttribute('createdOn') < settings.CreatedDate) ||
-                        (settings.CreatedOperation === Operation.LessThanOrEqual && venue.getAttribute('createdOn') <= settings.CreatedDate) ||
-                        (settings.CreatedOperation === Operation.GreaterThanOrEqual && venue.getAttribute('createdOn') >= settings.CreatedDate) ||
-                        (settings.CreatedOperation === Operation.GreaterThan && venue.getAttribute('createdOn') > settings.CreatedDate)) &&
+                        (settings.CreatedOperation === Operation.LessThan && venue.modificationData.createdOn < settings.CreatedDate) ||
+                        (settings.CreatedOperation === Operation.LessThanOrEqual && venue.modificationData.createdOn <= settings.CreatedDate) ||
+                        (settings.CreatedOperation === Operation.GreaterThanOrEqual && venue.modificationData.createdOn >= settings.CreatedDate) ||
+                        (settings.CreatedOperation === Operation.GreaterThan && venue.modificationData.createdOn > settings.CreatedDate)) &&
                     (!settings.Updated ||
-                        (settings.UpdatedOperation === Operation.LessThan && (venue.getAttribute('updatedOn') || venue.getAttribute('createdOn')) < settings.UpdatedDate) ||
-                        (settings.UpdatedOperation === Operation.LessThanOrEqual && (venue.getAttribute('updatedOn') || venue.getAttribute('createdOn')) <= settings.UpdatedDate) ||
-                        (settings.UpdatedOperation === Operation.GreaterThanOrEqual && (venue.getAttribute('updatedOn') || venue.getAttribute('createdOn')) >= settings.UpdatedDate) ||
-                        (settings.UpdatedOperation === Operation.GreaterThan && (venue.getAttribute('updatedOn') || venue.getAttribute('createdOn')) > settings.UpdatedDate)) &&
-                    ((settings.CreatedBy === null) ||
-                        (venue.getCreatedBy() === settings.CreatedBy)) &&
-                    ((settings.LastModifiedBy === null) ||
-                        ((venue.getUpdatedBy() ?? venue.getCreatedBy()) === settings.LastModifiedBy)) &&
+                        (settings.UpdatedOperation === Operation.LessThan && (venue.modificationData.updatedOn || venue.modificationData.createdOn) < settings.UpdatedDate) ||
+                        (settings.UpdatedOperation === Operation.LessThanOrEqual && (venue.modificationData.updatedOn || venue.modificationData.createdOn) <= settings.UpdatedDate) ||
+                        (settings.UpdatedOperation === Operation.GreaterThanOrEqual && (venue.modificationData.updatedOn || venue.modificationData.createdOn) >= settings.UpdatedDate) ||
+                        (settings.UpdatedOperation === Operation.GreaterThan && (venue.modificationData.updatedOn || venue.modificationData.createdOn) > settings.UpdatedDate)) &&
+                    ((settings.CreatedByName == "") ||
+                        (venue.modificationData.createdBy === settings.CreatedByName)) &&
+                    ((settings.LastModifiedByName == "") ||
+                        ((venue.modificationData.updatedBy ?? venue.modificationData.createdBy) === settings.LastModifiedByName)) &&
                     (websiteRegex === null ||
-                        websiteRegex.test(venue.getAttribute('url')))) {
+                        websiteRegex.test(venue.url))) {
                     let issues = 0;
                     if (state != null) {
-                        if (address && !address.isEmpty() && address.attributes.state) {
-                            if (settings.StateOperation === Operation.Equal && address.attributes.state.getAttribute('id') !== state.getAttribute('id') ||
-                                settings.StateOperation === Operation.NotEqual && address.attributes.state.getAttribute('id') === state.getAttribute('id')) {
+                        if (address && address.state) {
+                            if (settings.StateOperation === Operation.Equal && address.state.id !== state.id ||
+                                settings.StateOperation === Operation.NotEqual && address.state.id === state.id) {
                                 continue;
                             }
                         }
@@ -828,20 +813,6 @@ var WMEWAL_Places;
                             continue;
                         }
                     }
-                    // if (settings.LastModifiedBy != null) {
-                    //     if (venue.getAttribute('updatedBy') != null) {
-                    //         if (venue.getAttribute('updatedBy') !== settings.LastModifiedBy) {
-                    //             continue;
-                    //         }
-                    //     } else if (venue.getAttribute('createdBy') !== settings.LastModifiedBy) {
-                    //         continue;
-                    //     }
-                    // }
-                    // if (settings.CreatedBy != null) {
-                    //     if (venue.getAttribute('createdBy') !== settings.CreatedBy) {
-                    //         continue;
-                    //     }
-                    // }
                     if (settings.Category != null) {
                         if (!checkCategory(categories, settings.Category, settings.CategoryOperation)) {
                             continue;
@@ -850,8 +821,8 @@ var WMEWAL_Places;
                     let regExMatched = false;
                     if (cityRegex != null) {
                         regExMatched = false;
-                        if (address && !address.isEmpty() && address.attributes.city && !address.attributes.city.isEmpty() && address.attributes.city.hasName()) {
-                            regExMatched = cityRegex.test(address.attributes.city.getAttribute('name'));
+                        if (address && !address.isEmpty && address.city && !address.city.isEmpty) {
+                            regExMatched = cityRegex.test(address.city.name);
                         }
                         if (!regExMatched) {
                             continue;
@@ -859,8 +830,8 @@ var WMEWAL_Places;
                     }
                     if (streetRegex != null) {
                         regExMatched = false;
-                        if (address && !address.isEmpty() && !address.isEmptyStreet()) {
-                            regExMatched = streetRegex.test(address.attributes.street.getAttribute('name'));
+                        if (address && !address.isEmpty && !address.street.isEmpty) {
+                            regExMatched = streetRegex.test(address.street.name);
                         }
                         if (!regExMatched) {
                             continue;
@@ -868,54 +839,54 @@ var WMEWAL_Places;
                     }
                     if (settings.ParkingLotType) {
                         // Don't pay attention if we don't have a parking lot type
-                        if (!venue.getAttribute('categoryAttributes').PARKING_LOT ||
-                            venue.getAttribute('categoryAttributes').PARKING_LOT.parkingType !== settings.ParkingLotTypeFilter) {
+                        if (!isPLA ||
+                            plType !== settings.ParkingLotTypeFilter) {
                             continue;
                         }
                     }
-                    if (settings.NoName && !venue.getAttribute('name')) {
+                    if (settings.NoName && !venue.name) {
                         issues |= Issue.NoName;
                     }
                     if (settings.NoHouseNumber && houseNum == '') {
                         issues |= Issue.MissingHouseNumber;
                     }
-                    if (settings.AdLocked && venue.getAttribute('adLocked')) {
+                    if (settings.AdLocked && venue.isAdLocked) {
                         issues |= Issue.AdLocked;
                     }
-                    if (settings.UndefStreet && typeof W.model.streets.objects[venue.getAttribute('streetID')] === 'undefined') {
+                    if (settings.UndefStreet && (address.street == null)) {
                         issues |= Issue.UndefStreet;
                     }
-                    if (settings.UpdateRequests && venue.hasOpenUpdateRequests()) {
+                    if (settings.UpdateRequests && venue.venueUpdateRequests?.length > 0) {
                         issues |= Issue.HasUpdateRequests;
                     }
-                    if (settings.PendingApproval && !venue.isApproved()) {
+                    if (settings.PendingApproval && !venue.approved) {
                         issues |= Issue.PendingApproval;
                     }
-                    if (settings.NoStreet && (!address || address.isEmpty() || address.isEmptyStreet())) {
+                    if (settings.NoStreet && (!address || !address.street)) {
                         issues |= Issue.MissingStreet;
                     }
-                    if (settings.NoCity && (!address || address.isEmpty() || !address.getCity() || address.getCity().isEmpty())) {
+                    if (settings.NoCity && (!address || !address.city)) {
                         issues |= Issue.NoCity;
                     }
-                    if (settings.NoExternalProviders && (!venue.getAttribute('externalProviderIDs') || venue.getAttribute('externalProviderIDs').length === 0)) {
+                    if (settings.NoExternalProviders && (!venue.externalProviderIds || venue.externalProviderIds.length === 0)) {
                         issues |= Issue.NoExternalProviders;
                     }
-                    if (settings.NoHours && (!venue.getAttribute('openingHours') || venue.getAttribute('openingHours').length === 0)) {
+                    if (settings.NoHours && (!venue.openingHours || venue.openingHours.length === 0)) {
                         issues |= Issue.NoHours;
                     }
-                    if (settings.NoPhoneNumber && !venue.getAttribute('phone')) {
+                    if (settings.NoPhoneNumber && !venue.phone) {
                         issues |= Issue.NoPhoneNumber;
                     }
-                    if (settings.BadPhoneNumberFormat && (venue.getAttribute('phone') && !validPhoneRegex.test(venue.getAttribute('phone')))) {
+                    if (settings.BadPhoneNumberFormat && (venue.phone && !validPhoneRegex.test(venue.phone))) {
                         issues |= Issue.BadPhoneNumberFormat;
                     }
-                    if (settings.NoWebsite && !venue.getAttribute('url')) {
+                    if (settings.NoWebsite && !venue.url) {
                         issues |= Issue.NoWebsite;
                     }
-                    if (settings.NoEntryExitPoints && (!venue.getAttribute('entryExitPoints') || venue.getAttribute('entryExitPoints').length === 0)) {
+                    if (settings.NoEntryExitPoints && (!venue.navigationPoints || venue.navigationPoints.length === 0)) {
                         issues |= Issue.NoEntryExitPoints;
                     }
-                    if (settings.MissingBrand && checkCategory(categories, "GAS_STATION", Operation.Equal) && venue.getAttribute('brand') === null) {
+                    if (settings.MissingBrand && checkCategory(categories, "GAS_STATION", Operation.Equal) && venue.brand === null) {
                         issues |= Issue.MissingBrand;
                     }
                     if (detectIssues && issues === 0) {
@@ -926,34 +897,31 @@ var WMEWAL_Places;
                         continue;
                     }
                     // Don't add it if we've already done so
-                    if (savedVenues.indexOf(venue.getID()) === -1) {
-                        savedVenues.push(venue.getID());
-                        const lastEditorID = venue.getUpdatedBy() ?? venue.getCreatedBy();
-                        const lastEditor = W.model.users.getObjectById(lastEditorID);
-                        const createdByID = venue.getCreatedBy();
-                        const createdBy = W.model.users.getObjectById(createdByID);
+                    if (savedVenues.indexOf(venue.id) === -1) {
+                        savedVenues.push(venue.id);
+                        const lastEditor = venue.modificationData.updatedBy ?? venue.modificationData.createdBy;
+                        const createdBy = venue.modificationData.createdBy;
                         const place = {
-                            id: venue.getAttribute('id'),
-                            mainCategory: venue.getMainCategory(),
-                            name: venue.getAttribute('name'),
-                            lockLevel: venue.getLockRank() + 1,
-                            pointGeometry: venue.getOLGeometry().getCentroid(),
-                            // navigationPoint: venue.getNavigationPoint(),
+                            id: venue.id,
+                            mainCategory: venue.categories[0],
+                            name: venue.name,
+                            lockLevel: venue.lockRank + 1,
+                            pointGeometry: turf.centroid(venue.geometry),
                             categories: categories,
-                            streetID: venue.getAttribute('streetID'),
-                            placeType: ((venue.isPoint() && !venue.is2D()) ? I18n.t("edit.venue.type.point") : I18n.t("edit.venue.type.area")),
-                            isApproved: venue.isApproved(),
-                            city: ((address && !address.isEmpty() && address.attributes.city && !address.attributes.city.isEmpty() && address.attributes.city.hasName()) ? address.attributes.city.getAttribute('name') : "No City"),
-                            state: ((address && !address.isEmpty() && address.attributes.state) ? address.attributes.state.getAttribute('name') : "No State"),
+                            streetID: address.street?.id,
+                            placeType: ((venue.geometry.type == 'Point') ? I18n.t("edit.venue.type.point") : I18n.t("edit.venue.type.area")),
+                            isApproved: venue.approved,
+                            city: ((address && address.city?.name) ? address.city.name : "No City"),
+                            state: ((address && address.state?.name) ? address.state.name : "No State"),
                             houseNumber: houseNum,
-                            streetName: ((address && !address.isEmpty() && !address.isEmptyStreet()) ? address.attributes.street.getAttribute('name') : "") || "",
-                            lastEditor: lastEditor?.getAttribute('userName') ?? '',
-                            createdBy: createdBy?.getAttribute('userName') ?? '',
-                            url: venue.getAttribute('url') ?? "",
-                            phone: venue.getAttribute('phone') ?? "",
+                            streetName: ((address && address.street?.name) ? address.street.name : "") || "",
+                            lastEditor: lastEditor,
+                            createdBy: createdBy,
+                            url: venue.url ?? "",
+                            phone: venue.phone ?? "",
                             issues: issues,
-                            parkingLotType: (venue.getAttribute('categoryAttributes').PARKING_LOT && venue.getAttribute('categoryAttributes').PARKING_LOT.parkingType && I18n.t("edit.venue.parking.types.parkingType." + venue.getAttribute('categoryAttributes').PARKING_LOT.parkingType)) || "",
-                            altNames: [...venue.getAttribute('aliases')]
+                            parkingLotType: (isPLA && plType && I18n.t("edit.venue.parking.types.parkingType." + plType)) || "",
+                            altNames: [...venue.aliases]
                         };
                         places.push(place);
                     }
@@ -970,19 +938,25 @@ var WMEWAL_Places;
             places.sort(function (a, b) {
                 return a.name.localeCompare(b.name);
             });
-            const isCSV = (WMEWAL.outputTo & WMEWAL.OutputTo.CSV);
+            let isCSV = (WMEWAL.outputTo & WMEWAL.OutputTo.CSV) != 0;
             const isTab = (WMEWAL.outputTo & WMEWAL.OutputTo.Tab);
             const addBOM = WMEWAL.addBOM ?? false;
             const outputFields = WMEWAL.outputFields ?? ['CreatedEditor', 'LastEditor', 'LockLevel', 'Lat', 'Lon'];
-            const includeCreatedBy = outputFields.indexOf('CreatedEditor') > -1 || settings.CreatedBy !== null;
-            const includeLastUpdatedBy = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedBy !== null;
+            const includeCreatedBy = outputFields.indexOf('CreatedEditor') > -1 || settings.CreatedByName != "";
+            const includeLastUpdatedBy = outputFields.indexOf('LastEditor') > -1 || settings.LastModifiedByName != "";
             const includeLockLevel = outputFields.indexOf('LockLevel') > -1 || settings.LockLevel !== null;
             const includeLat = outputFields.indexOf('Lat') > -1;
             const includeLon = outputFields.indexOf('Lon') > -1;
             let lineArray;
             let columnArray;
-            let w;
+            let w = null;
             let fileName;
+            if (isTab) {
+                w = window.open();
+                if (!w || !w.document) {
+                    isCSV = true; // force CSV if popup-blocker
+                }
+            }
             if (isCSV) {
                 lineArray = [];
                 // (settings.undefStreet ? "Street ID," : "")
@@ -1019,8 +993,8 @@ var WMEWAL_Places;
             function getOperationText(operation) {
                 return operation === Operation.NotEqual ? "does not equal " : "equals ";
             }
-            if (isTab) {
-                w = window.open();
+            if (isTab && w && w.document) {
+                //w = window.open();
                 w.document.write("<html><head><title>Places</title></head><body>");
                 w.document.write("<h3>Area: " + WMEWAL.areaName + "</h3>");
                 w.document.write("<h4>Filters</h4>");
@@ -1057,10 +1031,10 @@ var WMEWAL_Places;
                 if (settings.PlaceType != null) {
                     w.document.write(`<div>Type ${I18n.t("edit.venue.type." + settings.PlaceType)}</div>`);
                 }
-                if (settings.LastModifiedBy != null) {
+                if (settings.LastModifiedByName != "") {
                     w.document.write(`<div>Last modified by ${lastModifiedByName}</div>`);
                 }
-                if (settings.CreatedBy != null) {
+                if (settings.CreatedByName != "") {
                     w.document.write(`<div>Created by ${createdByName}</div>`);
                 }
                 if (settings.EditableByMe) {
@@ -1187,7 +1161,7 @@ var WMEWAL_Places;
             for (let ixPlace = 0; ixPlace < places.length; ixPlace++) {
                 const place = places[ixPlace];
                 const plPlace = getPlacePL(place);
-                const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(place.pointGeometry.x, place.pointGeometry.y);
+                const latlon = { lon: place.pointGeometry.geometry.coordinates[0], lat: place.pointGeometry.geometry.coordinates[1] };
                 let categories = "";
                 for (let ixCategory = 0; ixCategory < place.categories.length; ixCategory++) {
                     if (ixCategory > 0) {
@@ -1229,7 +1203,7 @@ var WMEWAL_Places;
                     columnArray.push(`"${plPlace}"`);
                     lineArray.push(columnArray);
                 }
-                if (isTab) {
+                if (isTab && w && w.document) {
                     w.document.write(`<tr><td>${place.name}</td>`);
                     if (settings.IncludeAlt) {
                         w.document.write(`<td>${place.altNames.join(", ")}</td>`);
@@ -1283,7 +1257,7 @@ var WMEWAL_Places;
                 link.click();
                 document.body.removeChild(node);
             }
-            if (isTab) {
+            if (isTab && w && w.document) {
                 WMEWAL.writeErrText(w);
                 w.document.write("</tbody></table></body></html>");
                 w.document.close();
@@ -1319,8 +1293,8 @@ var WMEWAL_Places;
             CityRegexIgnoreCase: true,
             NoStreet: false,
             NoCity: false,
-            LastModifiedBy: null,
-            CreatedBy: null,
+            LastModifiedByName: "",
+            CreatedByName: "",
             UndefStreet: false,
             NoExternalProviders: false,
             NoHours: false,
@@ -1359,8 +1333,8 @@ var WMEWAL_Places;
                 settings.NoCity = false;
                 upd = true;
             }
-            if (!settings.hasOwnProperty("LastModifiedBy")) {
-                settings.LastModifiedBy = null;
+            if (!settings.hasOwnProperty("LastModifiedByName")) {
+                settings.LastModifiedByName = "";
                 upd = true;
             }
             if (!settings.hasOwnProperty("NoExternalProviders")) {
@@ -1453,8 +1427,8 @@ var WMEWAL_Places;
         return upd;
     }
     function getPlacePL(place) {
-        const latlon = OpenLayers.Layer.SphericalMercator.inverseMercator(place.pointGeometry.x, place.pointGeometry.y);
-        return WMEWAL.GenerateBasePL(latlon.lat, latlon.lon, 5) + "&mode=0&venues=" + place.id;
+        const latlon = { lon: place.pointGeometry.geometry.coordinates[0], lat: place.pointGeometry.geometry.coordinates[1] };
+        return WMEWAL.GenerateBasePL(latlon.lat, latlon.lon, 17) + "&mode=0&venues=" + place.id;
     }
     function getIssues(issues) {
         const issuesList = [];
@@ -1561,5 +1535,4 @@ var WMEWAL_Places;
             log('error', ex);
         }
     }
-    bootstrap();
 })(WMEWAL_Places || (WMEWAL_Places = {}));
